@@ -1,0 +1,14 @@
+[Unit]
+Description=Dell userspace fan policy daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/dell-fan-policy
+ExecStopPost=/bin/sh -c 'for d in /sys/class/hwmon/hwmon*; do [ "$$(cat $$d/name 2>/dev/null)" = "dell_smm" ] && echo 2 > $$d/pwm1_enable && break; done'
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
