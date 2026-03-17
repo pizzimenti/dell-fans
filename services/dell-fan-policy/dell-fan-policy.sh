@@ -400,7 +400,7 @@ desired_state() {
              && (on_ac == 0 || gpu_w < GPU_POWER_MAX_ON_AC_W) )); then
             early_low_ok=1
         fi
-        if (( wants_medium \
+        if (( wants_medium && ! wants_high \
            && cpu_c <= down1_cpu + EARLY_HIGH_TO_MEDIUM_MARGIN_C \
            && gpu_c <= down1_gpu + EARLY_HIGH_TO_MEDIUM_MARGIN_C \
            && cpu_prev_c >= cpu_c && gpu_prev_c >= gpu_c \
@@ -593,6 +593,9 @@ main() {
                 elif (( next_state == 1 )); then
                     step_down_hold_seconds="$early_high_to_low_hold_ms"
                 fi
+            elif (( current_state == 3 && next_state == 2 )); then
+                # MED→HIGH is urgency escalation, not a cool-down; allow immediately
+                step_down_hold_seconds=0
             else
                 step_down_hold_seconds="$low_hold_ms"
             fi
