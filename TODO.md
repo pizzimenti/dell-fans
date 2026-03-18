@@ -42,10 +42,8 @@ What has already been implemented:
 - Installer lives in `setup.sh` and `install-dell-fan-policy.sh`.
 
 2. Fan policy hysteresis / dwell
-- LOW dwell for `LOW -> HIGH` was extended from `10s` to `20s`.
-- `HIGH_HOLD_SECONDS` and `LOW_HOLD_SECONDS` were wired correctly.
-- `LOW_HOLD_SECONDS` was increased to `30s`.
-- Telemetry bug with absurd `low_dwell` values was fixed.
+- LOW/HIGH dwell gating has been removed so transitions follow temperature/power thresholds immediately.
+- The telemetry hiccup around `low_dwell` is no longer relevant now that the counter has gone away.
 
 3. Mismatch detection / recovery
 - We observed a real controller mismatch:
@@ -79,11 +77,7 @@ What has already been implemented:
 
 5. Faster loop
 - Policy loop was changed from `2.0s` to `0.5s` polling.
-- Timing was converted to millisecond-based logic for:
-  - dwell
-  - holds
-  - mismatch recovery cooldown
-- This made MED sound more constant and appeared to stabilize RPM better.
+- Timing was converted to millisecond-based logic for mismatch recovery cooldown, which stabilized RPM further.
 
 6. Latest local patch
 - Added periodic summary telemetry:

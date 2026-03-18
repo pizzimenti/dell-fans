@@ -28,7 +28,7 @@ run_case() {
     local expected="$8"
     local actual
 
-    actual="$(desired_state "$current" "$cpu" "$gpu" "$gpu_w" "$wifi" "$on_ac" 0 0 0 "balanced" 0)"
+    actual="$(desired_state "$current" "$cpu" "$gpu" "$gpu_w" "$wifi" "$on_ac" 0 0 "balanced")"
     assert_eq "$name" "$expected" "$actual"
 }
 

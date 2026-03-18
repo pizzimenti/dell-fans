@@ -62,24 +62,21 @@ def find_cooling_device(dev_type: str) -> str | None:
 POLICY = {
     "ac": {
         "up1_cpu":    55,  "up1_gpu":    55,   # →LOW
-        "up2_cpu":    75,  "up2_gpu":    72,   # →HIGH (after LOW dwell)
+        "up2_cpu":    75,  "up2_gpu":    72,   # →HIGH
         "down0_cpu":  50,  "down0_gpu":  50,   # LOW→OFF
         "down1_cpu":  70,  "down1_gpu":  67,   # HIGH→LOW
     },
     "bat": {
         "up1_cpu":    58,  "up1_gpu":    58,   # →LOW
-        "up2_cpu":    75,  "up2_gpu":    72,   # →HIGH (after LOW dwell)
+        "up2_cpu":    75,  "up2_gpu":    72,   # →HIGH
         "down0_cpu":  52,  "down0_gpu":  52,   # LOW→OFF
         "down1_cpu":  70,  "down1_gpu":  67,   # HIGH→LOW
     },
 }
 GPU_POWER_MAX_AC_W = 30    # → HIGH, AC only
-LOW_DWELL_S        = 20    # seconds LOW must be held before HIGH is allowed
 CPU_EMERGENCY_C     = 82
 GPU_EMERGENCY_C     = 80
 WIFI_GUARDRAIL_C    = 80
-HIGH_HOLD_S         = 30   # seconds HIGH must be held before stepping to LOW
-LOW_HOLD_S          = 30   # seconds LOW must be held before stepping to OFF
 LOW_SETTLED_RPM_MARGIN = 500
 LOW_MISMATCH_RPM_MARGIN = 1500
 
@@ -133,7 +130,7 @@ def is_on_ac() -> bool:
     return False
 
 
-# ── low dwell reader (parses last telemetry line from journal) ───────────────
+# ── policy telemetry reader (parses last telemetry line from journal) ───────
 
 def _read_policy_telemetry() -> dict[str, str]:
     """Parse the last policy telemetry line from the journal into key/value pairs."""
@@ -260,11 +257,6 @@ def collect() -> dict:
 
     # ── policy sensor inputs (same sources as dell-fan-policy.sh) ─────────
     data["on_ac"]       = is_on_ac()
-    if "low_dwell" in telemetry:
-        data["low_dwell_s"] = float(telemetry["low_dwell"].split("/")[0].rstrip("s"))
-    else:
-        data["low_dwell_s"] = 0.0
-
     k10 = find_hwmon("k10temp")
     data["cpu_c"] = _read_int(f"{k10}/temp1_input") / 1000.0 if k10 else 0.0
 
@@ -324,10 +316,8 @@ def build_criteria(data: dict) -> list[dict]:
     gpu_w      = data["gpu_w"]
     wifi_c     = data["wifi_c"]
     on_ac      = data["on_ac"]
-    low_dwell  = data.get("low_dwell_s", 0)
     th         = POLICY["ac"] if on_ac else POLICY["bat"]
 
-    dwell_met  = low_dwell >= LOW_DWELL_S
     wants_high = (cpu_c >= th["up2_cpu"] or gpu_c >= th["up2_gpu"]
                   or (on_ac and gpu_w >= GPU_POWER_MAX_AC_W))
 
@@ -335,7 +325,7 @@ def build_criteria(data: dict) -> list[dict]:
 
     # ── 0. Emergency ───────────────────────────────────────────────────────
     sections.append({
-        "header": "Emergency → HIGH (any, bypasses dwell)",
+        "header": "Emergency → HIGH (any)",
         "logic": "any",
         "rows": [
             _row(cpu_c  >= CPU_EMERGENCY_C,  "CPU",  cpu_c,                     CPU_EMERGENCY_C,  "°C"),
@@ -354,17 +344,15 @@ def build_criteria(data: dict) -> list[dict]:
         ],
     })
 
-    # ── 2. LOW → HIGH (temps AND dwell both required) ──────────────────────
+    # ── 2. LOW → HIGH (temps + power required) ─────────────────────────────
     ramp_high = [
         _row(cpu_c >= th["up2_cpu"], "CPU",      cpu_c, th["up2_cpu"], "°C"),
         _row(gpu_c >= th["up2_gpu"], "GPU",      gpu_c, th["up2_gpu"], "°C"),
     ]
     if on_ac:
         ramp_high.append(_row(gpu_w >= GPU_POWER_MAX_AC_W, "GPU power", gpu_w, GPU_POWER_MAX_AC_W, "W", "AC only"))
-    ramp_high.append(_row(dwell_met, "LOW dwell", low_dwell, LOW_DWELL_S, "s",
-                          f"held {low_dwell:.0f}/{LOW_DWELL_S}s"))
     sections.append({
-        "header": "Ramp to HIGH (temps AND dwell — all required)",
+        "header": "Ramp to HIGH (temps + power — all required)",
         "logic": "all_for_high",
         "rows": ramp_high,
     })
@@ -523,20 +511,16 @@ def draw(stdscr, data: dict, interval: float):
     col += len(src_str) + 2
     safe_addstr(stdscr, row, col, "  ".join(parts), p_attr)
     col += len("  ".join(parts)) + 2
-    safe_addstr(stdscr, row, col,
-                f"  holds H->{HIGH_HOLD_S}s L->{LOW_HOLD_S}s",
-                curses.color_pair(COLOR_DIM))
-    row += 1
     safe_addstr(stdscr, row, 0, "  " + "─" * min(max_x - 4, 62), curses.color_pair(COLOR_DIM))
     row += 1
 
     # Show only the section gating the NEXT upward transition.
-    # Index map: 0=emergency, 1=ramp_low, 2=ramp_high(+dwell), 3=cool_high_low, 4=cool_low_off
+    # Index map: 0=emergency, 1=ramp_low, 2=ramp_high, 3=cool_high_low, 4=cool_low_off
     all_sections = build_criteria(data)
     if level == 0:
         show_idxs = [1]   # what triggers LOW (HIGH is blocked by step-through anyway)
     elif level in (1, 3):
-        show_idxs = [2]   # what gates HIGH (temps + dwell counter)
+        show_idxs = [2]   # what gates HIGH (temps + power)
     else:
         show_idxs = [3]   # when HIGH will drop back to LOW
 
@@ -550,7 +534,7 @@ def draw(stdscr, data: dict, interval: float):
         all_met = all(r["met"] for r in rows)
 
         if logic == "all_for_high":
-            # HIGH requires ALL conditions (temps + dwell)
+            # HIGH requires ALL conditions (temps + power)
             active = all_met
         elif logic == "any":
             active = any_met

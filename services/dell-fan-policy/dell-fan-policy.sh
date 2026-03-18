@@ -10,16 +10,11 @@ set -euo pipefail
 # - CPU and GPU temperatures are primary inputs.
 # - GPU package power can force a higher state on AC.
 # - Wi-Fi temperature is guardrail-only and does not affect normal fan states.
-# - Fan ramps up quickly and ramps down slowly via hysteresis + dwell time.
+# - Fan now responds directly to temperature/power without enforced dwell periods.
 
 readonly POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-0.5}"
-readonly HIGH_HOLD_SECONDS="${HIGH_HOLD_SECONDS:-30}"  # HIGH must run this long before stepping to LOW
-readonly LOW_HOLD_SECONDS="${LOW_HOLD_SECONDS:-30}"    # LOW must run this long before stepping to OFF
-readonly LOW_DWELL_SECONDS="${LOW_DWELL_SECONDS:-20}"  # LOW must run this long before HIGH is allowed
-readonly EARLY_HIGH_TO_LOW_HOLD_SECONDS="${EARLY_HIGH_TO_LOW_HOLD_SECONDS:-12}"  # minimum HIGH time before predictive step-down
 readonly EARLY_HIGH_TO_LOW_MARGIN_C="${EARLY_HIGH_TO_LOW_MARGIN_C:-5}"            # allow early LOW this close to normal thresholds
 readonly EARLY_HIGH_TO_LOW_DROP_C="${EARLY_HIGH_TO_LOW_DROP_C:-2}"                # require a meaningful cooling trend
-readonly EARLY_HIGH_TO_MEDIUM_HOLD_SECONDS="${EARLY_HIGH_TO_MEDIUM_HOLD_SECONDS:-6}"
 readonly EARLY_HIGH_TO_MEDIUM_MARGIN_C="${EARLY_HIGH_TO_MEDIUM_MARGIN_C:-12}"
 readonly LOW_SETTLED_RPM_MARGIN="${LOW_SETTLED_RPM_MARGIN:-500}"                  # LOW timers start only after RPM is near target
 readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"               # LOW mismatch if RPM stays this far above target
@@ -326,13 +321,6 @@ read_platform_profile() {
     read_first_line "$platform_profile_path" 2>/dev/null || printf 'balanced\n'
 }
 
-is_low_fan_settled() {
-    local rpm="$1"
-    local target="$2"
-    local hw_state="$3"
-    (( hw_state == 1 && target > 0 && rpm <= target + LOW_SETTLED_RPM_MARGIN ))
-}
-
 is_low_fan_mismatch() {
     local rpm="$1"
     local target="$2"
@@ -347,11 +335,9 @@ desired_state() {
     local gpu_w="$4"
     local wifi_c="$5"
     local on_ac="$6"
-    local low_dwell_met="$7"   # 1 if LOW has been held long enough to allow HIGH
-    local cpu_prev_c="$8"
-    local gpu_prev_c="$9"
-    local platform_profile="${10}"
-    local low_ready="${11}"
+    local cpu_prev_c="$7"
+    local gpu_prev_c="$8"
+    local platform_profile="${9}"
 
     # Emergency: always max, bypasses dwell and step-through
     if (( cpu_c >= CPU_EMERGENCY_C || gpu_c >= CPU_EMERGENCY_C || wifi_c >= WIFI_GUARDRAIL_C )); then
@@ -426,8 +412,8 @@ desired_state() {
                 printf '0\n'
             fi
             ;;
-        1)  # LOW: can go to HIGH only after dwell period
-            if (( wants_high && low_dwell_met )); then
+        1)  # LOW: can go to HIGH immediately on high demand
+            if (( wants_high )); then
                 printf '%s\n' "$(clamp_state 2)"
             elif (( wants_medium )); then
                 printf '3\n'
@@ -494,19 +480,14 @@ main() {
 
     local cpu_raw gpu_raw gpu_power_raw wifi_raw cpu_c gpu_c gpu_w wifi_c platform_profile
     local prev_cpu_c=0 prev_gpu_c=0
-    local fan_rpm fan_target pwm_value hw_fan_state cmd_state last_cmd_state=-1 low_fan_settled=0 low_fan_mismatch=0
+    local fan_rpm fan_target pwm_value hw_fan_state cmd_state last_cmd_state=-1 low_fan_mismatch=0
     local mismatch_polls=0 last_recovery_epoch=0 medium_phase=0
-    local on_ac current_state next_state low_dwell_met step_down_hold_seconds
-    local last_change_epoch=0 low_entered_epoch=0 now low_dwell_elapsed=0
-    local high_hold_ms low_hold_ms low_dwell_ms early_high_to_low_hold_ms early_high_to_medium_hold_ms mismatch_recovery_cooldown_ms summary_interval_ms
+    local on_ac current_state next_state
+    local last_change_epoch=0 now
+    local mismatch_recovery_cooldown_ms summary_interval_ms
     local last_summary_epoch=0 summary_samples=0 recovery_events=0 mismatch_events=0
     local sum_cpu=0 sum_gpu=0 sum_gpu_w=0 sum_rpm=0 state0_samples=0 state1_samples=0 state2_samples=0 state3_samples=0
 
-    high_hold_ms="$(seconds_to_ms "$HIGH_HOLD_SECONDS")"
-    low_hold_ms="$(seconds_to_ms "$LOW_HOLD_SECONDS")"
-    low_dwell_ms="$(seconds_to_ms "$LOW_DWELL_SECONDS")"
-    early_high_to_low_hold_ms="$(seconds_to_ms "$EARLY_HIGH_TO_LOW_HOLD_SECONDS")"
-    early_high_to_medium_hold_ms="$(seconds_to_ms "$EARLY_HIGH_TO_MEDIUM_HOLD_SECONDS")"
     mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
     summary_interval_ms="$(seconds_to_ms "$SUMMARY_INTERVAL_SECONDS")"
 
@@ -549,7 +530,6 @@ main() {
 
         now="$(now_ms)"
 
-        # LOW dwell: track how long we've been at LOW and physically near the LOW target.
         if (( current_state == 1 )); then
             if is_low_fan_mismatch "$fan_rpm" "$fan_target" "$hw_fan_state"; then
                 low_fan_mismatch=1
@@ -558,61 +538,17 @@ main() {
                 low_fan_mismatch=0
                 mismatch_polls=0
             fi
-            if is_low_fan_settled "$fan_rpm" "$fan_target" "$hw_fan_state"; then
-                low_fan_settled=1
-                if (( low_entered_epoch == 0 )); then
-                    low_entered_epoch="$now"
-                fi
-                low_dwell_elapsed=$(( now - low_entered_epoch ))
-                if (( low_dwell_elapsed >= low_dwell_ms )); then
-                    low_dwell_met=1
-                else
-                    low_dwell_met=0
-                fi
-            else
-                low_fan_settled=0
-                low_entered_epoch=0
-                low_dwell_elapsed=0
-                low_dwell_met=0
-            fi
         else
-            low_fan_settled=0
             low_fan_mismatch=0
             mismatch_polls=0
-            low_entered_epoch=0
-            low_dwell_elapsed=0
-            low_dwell_met=0
         fi
 
-        next_state="$(desired_state "$current_state" "$cpu_c" "$gpu_c" "$gpu_w" "$wifi_c" "$on_ac" "$low_dwell_met" "$prev_cpu_c" "$prev_gpu_c" "$platform_profile" "$low_fan_settled")"
+        next_state="$(desired_state "$current_state" "$cpu_c" "$gpu_c" "$gpu_w" "$wifi_c" "$on_ac" "$prev_cpu_c" "$prev_gpu_c" "$platform_profile")"
 
-        if (( next_state > current_state )); then
+        if (( next_state != current_state )); then
             current_state="$next_state"
             last_change_epoch="$now"
-            low_entered_epoch=0
-            low_dwell_elapsed=0
             medium_phase=0
-        elif (( next_state < current_state )); then
-            if (( current_state == 2 )); then
-                step_down_hold_seconds="$high_hold_ms"
-                if (( next_state == 3 )); then
-                    step_down_hold_seconds="$early_high_to_medium_hold_ms"
-                elif (( next_state == 1 )); then
-                    step_down_hold_seconds="$early_high_to_low_hold_ms"
-                fi
-            elif (( current_state == 3 && next_state == 2 )); then
-                # MED→HIGH is urgency escalation, not a cool-down; allow immediately
-                step_down_hold_seconds=0
-            else
-                step_down_hold_seconds="$low_hold_ms"
-            fi
-            if (( now - last_change_epoch >= step_down_hold_seconds )); then
-                current_state="$next_state"
-                last_change_epoch="$now"
-                low_entered_epoch=0
-                low_dwell_elapsed=0
-                medium_phase=0
-            fi
         fi
 
         cmd_state="$(commanded_hw_state "$current_state" "$medium_phase")"
@@ -639,15 +575,11 @@ main() {
                 hw_fan_state="$(read_hw_fan_state)"
                 if is_low_fan_mismatch "$fan_rpm" "$fan_target" "$hw_fan_state"; then
                     low_fan_mismatch=1
-                    low_fan_settled=0
-                    low_entered_epoch=0
-                    low_dwell_elapsed=0
-                    low_dwell_met=0
                 fi
             fi
         fi
 
-        log "telemetry ac=${on_ac} profile=${platform_profile} cpu=${cpu_c}C gpu=${gpu_c}C gpu_ppt=${gpu_w}W wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} low_ready=${low_fan_settled} low_mismatch=${low_fan_mismatch} mismatch_polls=${mismatch_polls} low_dwell=$(format_tenths_s "$low_dwell_elapsed")s/${LOW_DWELL_SECONDS}s"
+        log "telemetry ac=${on_ac} profile=${platform_profile} cpu=${cpu_c}C gpu=${gpu_c}C gpu_ppt=${gpu_w}W wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} low_mismatch=${low_fan_mismatch} mismatch_polls=${mismatch_polls}"
         if (( low_fan_mismatch )); then
             log "WARNING: LOW mismatch hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value}"
             mismatch_events=$(( mismatch_events + 1 ))
