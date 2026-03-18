@@ -13,19 +13,16 @@ set -euo pipefail
 # - Fan now responds directly to temperature/power without enforced dwell periods.
 
 readonly POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-0.5}"
-readonly EARLY_HIGH_TO_LOW_MARGIN_C="${EARLY_HIGH_TO_LOW_MARGIN_C:-5}"            # allow early LOW this close to normal thresholds
-readonly EARLY_HIGH_TO_LOW_DROP_C="${EARLY_HIGH_TO_LOW_DROP_C:-2}"                # require a meaningful cooling trend
-readonly EARLY_HIGH_TO_MEDIUM_MARGIN_C="${EARLY_HIGH_TO_MEDIUM_MARGIN_C:-12}"
 readonly LOW_SETTLED_RPM_MARGIN="${LOW_SETTLED_RPM_MARGIN:-500}"                  # LOW timers start only after RPM is near target
 readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"               # LOW mismatch if RPM stays this far above target
 readonly MISMATCH_RECOVERY_POLLS="${MISMATCH_RECOVERY_POLLS:-3}"                  # consecutive mismatch polls before corrective action
 readonly MISMATCH_RECOVERY_COOLDOWN_SECONDS="${MISMATCH_RECOVERY_COOLDOWN_SECONDS:-20}"
 readonly MISMATCH_RECOVERY_SETTLE_SECONDS="${MISMATCH_RECOVERY_SETTLE_SECONDS:-1}"
-readonly MEDIUM_UP_CPU_C="${MEDIUM_UP_CPU_C:-60}"        # Lowered from 63 to 60 for early ramp-up
-readonly MEDIUM_UP_GPU_C="${MEDIUM_UP_GPU_C:-58}"        # Lowered from 60 to 58
-readonly MEDIUM_UP_GPU_W="${MEDIUM_UP_GPU_W:-15}"
-readonly MEDIUM_DOWN_CPU_C="${MEDIUM_DOWN_CPU_C:-58}"
-readonly MEDIUM_DOWN_GPU_C="${MEDIUM_DOWN_GPU_C:-56}"
+readonly MEDIUM_UP_CPU_C="${MEDIUM_UP_CPU_C:-68}"
+readonly MEDIUM_UP_GPU_C="${MEDIUM_UP_GPU_C:-64}"
+readonly MEDIUM_UP_GPU_W="${MEDIUM_UP_GPU_W:-16}"
+readonly MEDIUM_DOWN_CPU_C="${MEDIUM_DOWN_CPU_C:-66}"
+readonly MEDIUM_DOWN_GPU_C="${MEDIUM_DOWN_GPU_C:-66}"
 readonly MEDIUM_DOWN_GPU_W="${MEDIUM_DOWN_GPU_W:-12}"
 readonly MEDIUM_HIGH_SLOT_EVERY="${MEDIUM_HIGH_SLOT_EVERY:-3}"
 readonly SUMMARY_INTERVAL_SECONDS="${SUMMARY_INTERVAL_SECONDS:-60}"
@@ -33,25 +30,28 @@ readonly WIFI_GUARDRAIL_C="${WIFI_GUARDRAIL_C:-80}"
 readonly CPU_EMERGENCY_C="${CPU_EMERGENCY_C:-82}"
 readonly GPU_EMERGENCY_C="${GPU_EMERGENCY_C:-80}"
 # Fan levels: 0=OFF  1=LOW  2=HIGH
-readonly GPU_POWER_MAX_ON_AC_W="${GPU_POWER_MAX_ON_AC_W:-30}"
+readonly GPU_POWER_MAX_ON_AC_W="${GPU_POWER_MAX_ON_AC_W:-40}"
+readonly HIGH_ENTRY_CPU_MARGIN_C="${HIGH_ENTRY_CPU_MARGIN_C:-2}"
+readonly HIGH_ENTRY_GPU_MARGIN_C="${HIGH_ENTRY_GPU_MARGIN_C:-2}"
+readonly HIGH_ENTRY_GPU_W_MARGIN="${HIGH_ENTRY_GPU_W_MARGIN:-5}"
 
 readonly AC_UP_STATE1_CPU_C="${AC_UP_STATE1_CPU_C:-50}"   # Lowered from 55 for early LOW
 readonly AC_UP_STATE1_GPU_C="${AC_UP_STATE1_GPU_C:-50}"
-readonly AC_UP_STATE2_CPU_C="${AC_UP_STATE2_CPU_C:-72}"   # Lowered from 75 for early HIGH
-readonly AC_UP_STATE2_GPU_C="${AC_UP_STATE2_GPU_C:-70}"
+readonly AC_UP_STATE2_CPU_C="${AC_UP_STATE2_CPU_C:-80}"
+readonly AC_UP_STATE2_GPU_C="${AC_UP_STATE2_GPU_C:-78}"
 readonly AC_DOWN_STATE0_CPU_C="${AC_DOWN_STATE0_CPU_C:-48}"
 readonly AC_DOWN_STATE0_GPU_C="${AC_DOWN_STATE0_GPU_C:-48}"
-readonly AC_DOWN_STATE1_CPU_C="${AC_DOWN_STATE1_CPU_C:-68}"  # Lowered from 70
-readonly AC_DOWN_STATE1_GPU_C="${AC_DOWN_STATE1_GPU_C:-65}"
+readonly AC_DOWN_STATE1_CPU_C="${AC_DOWN_STATE1_CPU_C:-66}"
+readonly AC_DOWN_STATE1_GPU_C="${AC_DOWN_STATE1_GPU_C:-66}"
 
 readonly BAT_UP_STATE1_CPU_C="${BAT_UP_STATE1_CPU_C:-55}"
 readonly BAT_UP_STATE1_GPU_C="${BAT_UP_STATE1_GPU_C:-55}"
-readonly BAT_UP_STATE2_CPU_C="${BAT_UP_STATE2_CPU_C:-75}"
-readonly BAT_UP_STATE2_GPU_C="${BAT_UP_STATE2_GPU_C:-72}"
+readonly BAT_UP_STATE2_CPU_C="${BAT_UP_STATE2_CPU_C:-82}"
+readonly BAT_UP_STATE2_GPU_C="${BAT_UP_STATE2_GPU_C:-80}"
 readonly BAT_DOWN_STATE0_CPU_C="${BAT_DOWN_STATE0_CPU_C:-52}"
 readonly BAT_DOWN_STATE0_GPU_C="${BAT_DOWN_STATE0_GPU_C:-52}"
-readonly BAT_DOWN_STATE1_CPU_C="${BAT_DOWN_STATE1_CPU_C:-70}"
-readonly BAT_DOWN_STATE1_GPU_C="${BAT_DOWN_STATE1_GPU_C:-67}"
+readonly BAT_DOWN_STATE1_CPU_C="${BAT_DOWN_STATE1_CPU_C:-66}"
+readonly BAT_DOWN_STATE1_GPU_C="${BAT_DOWN_STATE1_GPU_C:-66}"
 
 readonly CPU_SENSOR_LABEL="${CPU_SENSOR_LABEL:-Tctl}"
 readonly GPU_SENSOR_LABEL="${GPU_SENSOR_LABEL:-edge}"
@@ -366,7 +366,7 @@ desired_state() {
         down1_cpu="$BAT_DOWN_STATE1_CPU_C"; down1_gpu="$BAT_DOWN_STATE1_GPU_C"
     fi
 
-    local wants_high=0 wants_low=0 wants_medium=0 early_low_ok=0 early_medium_ok=0
+    local wants_high=0 wants_low=0 wants_medium=0 hard_high=0
     if (( cpu_c >= up2_cpu || gpu_c >= up2_gpu || (on_ac == 1 && gpu_w >= GPU_POWER_MAX_ON_AC_W) )); then
         wants_high=1
     fi
@@ -380,28 +380,10 @@ desired_state() {
             wants_medium=1
         fi
     fi
-    if (( cpu_prev_c > 0 || gpu_prev_c > 0 )); then
-        if (( cpu_c <= down1_cpu + EARLY_HIGH_TO_LOW_MARGIN_C \
-           && gpu_c <= down1_gpu + EARLY_HIGH_TO_LOW_MARGIN_C \
-           && cpu_prev_c - cpu_c >= EARLY_HIGH_TO_LOW_DROP_C \
-           && gpu_prev_c - gpu_c >= 0 \
-           && (on_ac == 0 || gpu_w < GPU_POWER_MAX_ON_AC_W) )); then
-            early_low_ok=1
-        elif (( cpu_c <= down1_cpu + EARLY_HIGH_TO_LOW_MARGIN_C \
-             && gpu_c <= down1_gpu + EARLY_HIGH_TO_LOW_MARGIN_C \
-             && gpu_prev_c - gpu_c >= EARLY_HIGH_TO_LOW_DROP_C \
-             && cpu_prev_c - cpu_c >= 0 \
-             && (on_ac == 0 || gpu_w < GPU_POWER_MAX_ON_AC_W) )); then
-            early_low_ok=1
-        fi
-        if (( wants_medium && ! wants_high \
-           && cpu_c <= down1_cpu + EARLY_HIGH_TO_MEDIUM_MARGIN_C \
-           && gpu_c <= down1_gpu + EARLY_HIGH_TO_MEDIUM_MARGIN_C \
-           && cpu_prev_c >= cpu_c && gpu_prev_c >= gpu_c \
-           && (cpu_prev_c - cpu_c >= 1 || gpu_prev_c - gpu_c >= 1) \
-           && (on_ac == 0 || gpu_w < GPU_POWER_MAX_ON_AC_W) )); then
-            early_medium_ok=1
-        fi
+    if (( cpu_c >= up2_cpu + HIGH_ENTRY_CPU_MARGIN_C \
+       || gpu_c >= up2_gpu + HIGH_ENTRY_GPU_MARGIN_C \
+       || (on_ac == 1 && gpu_w >= GPU_POWER_MAX_ON_AC_W + HIGH_ENTRY_GPU_W_MARGIN) )); then
+        hard_high=1
     fi
 
     case "$current_state" in
@@ -412,10 +394,8 @@ desired_state() {
                 printf '0\n'
             fi
             ;;
-        1)  # LOW: can go to HIGH immediately on high demand
-            if (( wants_high )); then
-                printf '%s\n' "$(clamp_state 2)"
-            elif (( wants_medium )); then
+        1)  # LOW: always pass through MEDIUM before HIGH
+            if (( wants_medium || wants_high )); then
                 printf '3\n'
             elif (( cpu_c <= down0_cpu && gpu_c <= down0_gpu )); then
                 printf '0\n'
@@ -424,33 +404,23 @@ desired_state() {
             fi
             ;;
         3)  # MED: synthetic medium using a LOW/HIGH duty cycle
-            if (( wants_high )); then
+            if (( hard_high \
+               && (cpu_prev_c == 0 || gpu_prev_c == 0 || cpu_c >= cpu_prev_c || gpu_c >= gpu_prev_c) )); then
                 printf '%s\n' "$(clamp_state 2)"
-            elif (( wants_medium )); then
+            elif (( wants_medium || wants_high )); then
                 printf '3\n'
             else
                 printf '1\n'
             fi
             ;;
         *)  # HIGH: cool down when temps drop
-            if (( wants_high )); then
+            if (( hard_high \
+               && (cpu_prev_c == 0 || gpu_prev_c == 0 || (cpu_c >= cpu_prev_c && gpu_c >= gpu_prev_c)) )); then
                 printf '%s\n' "$(clamp_state 2)"
-            elif (( cpu_c <= down1_cpu && gpu_c <= down1_gpu && (on_ac == 0 || gpu_w < GPU_POWER_MAX_ON_AC_W) )); then
-                if (( wants_medium )); then
-                    printf '3\n'
-                else
-                    printf '1\n'
-                fi
-            elif (( early_medium_ok )); then
+            elif (( wants_medium || wants_high )); then
                 printf '3\n'
-            elif (( early_low_ok )); then
-                if (( wants_medium )); then
-                    printf '3\n'
-                else
-                    printf '1\n'
-                fi
             else
-                printf '%s\n' "$(clamp_state 2)"
+                printf '1\n'
             fi
             ;;
     esac
@@ -510,6 +480,9 @@ main() {
             sleep "$POLL_INTERVAL_SECONDS"
             continue
         fi
+
+        gpu_power_raw="$(read_power_value_microwatts "amdgpu" "$GPU_POWER_LABEL" 2>/dev/null || printf '0\n')"
+        wifi_raw="$(read_wifi_temp_millideg 2>/dev/null || printf '0\n')"
 
         cpu_c="$(to_celsius_int "$cpu_raw")"
         gpu_c="$(to_celsius_int "$gpu_raw")"

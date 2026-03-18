@@ -61,19 +61,28 @@ def find_cooling_device(dev_type: str) -> str | None:
 # Must stay in sync with dell-fan-policy.sh
 POLICY = {
     "ac": {
-        "up1_cpu":    55,  "up1_gpu":    55,   # →LOW
-        "up2_cpu":    75,  "up2_gpu":    72,   # →HIGH
+        "up1_cpu":    50,  "up1_gpu":    50,   # →LOW
+        "up2_cpu":    80,  "up2_gpu":    78,   # →HIGH
         "down0_cpu":  50,  "down0_gpu":  50,   # LOW→OFF
-        "down1_cpu":  70,  "down1_gpu":  67,   # HIGH→LOW
+        "down1_cpu":  66,  "down1_gpu":  66,   # MED/HIGH→LOW band floor
     },
     "bat": {
-        "up1_cpu":    58,  "up1_gpu":    58,   # →LOW
-        "up2_cpu":    75,  "up2_gpu":    72,   # →HIGH
+        "up1_cpu":    55,  "up1_gpu":    55,   # →LOW
+        "up2_cpu":    82,  "up2_gpu":    80,   # →HIGH
         "down0_cpu":  52,  "down0_gpu":  52,   # LOW→OFF
-        "down1_cpu":  70,  "down1_gpu":  67,   # HIGH→LOW
+        "down1_cpu":  66,  "down1_gpu":  66,   # MED/HIGH→LOW band floor
     },
 }
-GPU_POWER_MAX_AC_W = 30    # → HIGH, AC only
+MEDIUM_UP_CPU_C      = 68
+MEDIUM_UP_GPU_C      = 64
+MEDIUM_UP_GPU_W      = 16
+MEDIUM_DOWN_CPU_C    = 66
+MEDIUM_DOWN_GPU_C    = 66
+MEDIUM_DOWN_GPU_W    = 12
+GPU_POWER_MAX_AC_W = 40    # → HIGH, AC only
+HIGH_ENTRY_CPU_MARGIN_C = 2
+HIGH_ENTRY_GPU_MARGIN_C = 2
+HIGH_ENTRY_GPU_W_MARGIN = 5
 CPU_EMERGENCY_C     = 82
 GPU_EMERGENCY_C     = 80
 WIFI_GUARDRAIL_C    = 80
@@ -318,9 +327,6 @@ def build_criteria(data: dict) -> list[dict]:
     on_ac      = data["on_ac"]
     th         = POLICY["ac"] if on_ac else POLICY["bat"]
 
-    wants_high = (cpu_c >= th["up2_cpu"] or gpu_c >= th["up2_gpu"]
-                  or (on_ac and gpu_w >= GPU_POWER_MAX_AC_W))
-
     sections = []
 
     # ── 0. Emergency ───────────────────────────────────────────────────────
@@ -344,29 +350,52 @@ def build_criteria(data: dict) -> list[dict]:
         ],
     })
 
-    # ── 2. LOW → HIGH (temps + power required) ─────────────────────────────
+    # ── 2. LOW/MED → MEDIUM (any sufficient) ───────────────────────────────
+    ramp_medium = [
+        _row(cpu_c >= MEDIUM_UP_CPU_C, "CPU", cpu_c, MEDIUM_UP_CPU_C, "°C"),
+        _row(gpu_c >= MEDIUM_UP_GPU_C, "GPU", gpu_c, MEDIUM_UP_GPU_C, "°C"),
+        _row(gpu_w >= MEDIUM_UP_GPU_W, "GPU power", gpu_w, MEDIUM_UP_GPU_W, "W"),
+    ]
+    sections.append({
+        "header": "Ramp to MEDIUM (any sufficient)",
+        "logic": "any",
+        "rows": ramp_medium,
+    })
+
+    # ── 3. MEDIUM → HIGH (overshoot required) ──────────────────────────────
     ramp_high = [
-        _row(cpu_c >= th["up2_cpu"], "CPU",      cpu_c, th["up2_cpu"], "°C"),
-        _row(gpu_c >= th["up2_gpu"], "GPU",      gpu_c, th["up2_gpu"], "°C"),
+        _row(cpu_c >= th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "CPU", cpu_c, th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "°C"),
+        _row(gpu_c >= th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "GPU", gpu_c, th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "°C"),
     ]
     if on_ac:
-        ramp_high.append(_row(gpu_w >= GPU_POWER_MAX_AC_W, "GPU power", gpu_w, GPU_POWER_MAX_AC_W, "W", "AC only"))
+        ramp_high.append(_row(gpu_w >= GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "GPU power", gpu_w, GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "W", "AC only"))
     sections.append({
-        "header": "Ramp to HIGH (temps + power — all required)",
-        "logic": "all_for_high",
+        "header": "Ramp to HIGH (overshoot; any sufficient)",
+        "logic": "any",
         "rows": ramp_high,
     })
 
-    # ── 3. HIGH → LOW cool-down (all required) ─────────────────────────────
+    # ── 4. HIGH → MEDIUM cool-down (leave hard-high band) ──────────────────
     cd1 = [
-        _row(cpu_c <= th["down1_cpu"], "CPU", cpu_c, th["down1_cpu"], "°C", cool=True),
-        _row(gpu_c <= th["down1_gpu"], "GPU", gpu_c, th["down1_gpu"], "°C", cool=True),
+        _row(cpu_c < th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "CPU", cpu_c, th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "°C", cool=True),
+        _row(gpu_c < th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "GPU", gpu_c, th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "°C", cool=True),
     ]
     if on_ac:
-        cd1.append(_row(gpu_w < GPU_POWER_MAX_AC_W, "GPU power", gpu_w, GPU_POWER_MAX_AC_W, "W", "AC only", cool=True))
-    sections.append({"header": "Cool HIGH → LOW (all required)", "logic": "all", "rows": cd1})
+        cd1.append(_row(gpu_w < GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "GPU power", gpu_w, GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "W", "AC only", cool=True))
+    sections.append({"header": "Cool HIGH → MEDIUM (all required)", "logic": "all", "rows": cd1})
 
-    # ── 4. LOW → OFF cool-down (all required) ──────────────────────────────
+    # ── 5. MEDIUM → LOW cool-down (all required) ───────────────────────────
+    sections.append({
+        "header": "Cool MEDIUM → LOW (all required)",
+        "logic": "all",
+        "rows": [
+            _row(cpu_c < MEDIUM_DOWN_CPU_C, "CPU", cpu_c, MEDIUM_DOWN_CPU_C, "°C", cool=True),
+            _row(gpu_c < MEDIUM_DOWN_GPU_C, "GPU", gpu_c, MEDIUM_DOWN_GPU_C, "°C", cool=True),
+            _row(gpu_w < MEDIUM_DOWN_GPU_W, "GPU power", gpu_w, MEDIUM_DOWN_GPU_W, "W", cool=True),
+        ],
+    })
+
+    # ── 6. LOW → OFF cool-down (all required) ──────────────────────────────
     sections.append({
         "header": "Cool LOW → OFF (all required)",
         "logic": "all",
