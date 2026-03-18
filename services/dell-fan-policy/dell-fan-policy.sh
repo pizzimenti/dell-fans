@@ -26,36 +26,36 @@ readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"             
 readonly MISMATCH_RECOVERY_POLLS="${MISMATCH_RECOVERY_POLLS:-3}"                  # consecutive mismatch polls before corrective action
 readonly MISMATCH_RECOVERY_COOLDOWN_SECONDS="${MISMATCH_RECOVERY_COOLDOWN_SECONDS:-20}"
 readonly MISMATCH_RECOVERY_SETTLE_SECONDS="${MISMATCH_RECOVERY_SETTLE_SECONDS:-1}"
-readonly MEDIUM_UP_CPU_C="${MEDIUM_UP_CPU_C:-63}"        # performance-mode synthetic medium
-readonly MEDIUM_UP_GPU_C="${MEDIUM_UP_GPU_C:-60}"
+readonly MEDIUM_UP_CPU_C="${MEDIUM_UP_CPU_C:-60}"        # Lowered from 63 to 60 for early ramp-up
+readonly MEDIUM_UP_GPU_C="${MEDIUM_UP_GPU_C:-58}"        # Lowered from 60 to 58
 readonly MEDIUM_UP_GPU_W="${MEDIUM_UP_GPU_W:-15}"
 readonly MEDIUM_DOWN_CPU_C="${MEDIUM_DOWN_CPU_C:-58}"
 readonly MEDIUM_DOWN_GPU_C="${MEDIUM_DOWN_GPU_C:-56}"
 readonly MEDIUM_DOWN_GPU_W="${MEDIUM_DOWN_GPU_W:-12}"
-readonly MEDIUM_HIGH_SLOT_EVERY="${MEDIUM_HIGH_SLOT_EVERY:-3}"  # 1 HIGH slot every N polls, rest LOW
+readonly MEDIUM_HIGH_SLOT_EVERY="${MEDIUM_HIGH_SLOT_EVERY:-3}"
 readonly SUMMARY_INTERVAL_SECONDS="${SUMMARY_INTERVAL_SECONDS:-60}"
 readonly WIFI_GUARDRAIL_C="${WIFI_GUARDRAIL_C:-80}"
 readonly CPU_EMERGENCY_C="${CPU_EMERGENCY_C:-82}"
 readonly GPU_EMERGENCY_C="${GPU_EMERGENCY_C:-80}"
 # Fan levels: 0=OFF  1=LOW  2=HIGH
-readonly GPU_POWER_MAX_ON_AC_W="${GPU_POWER_MAX_ON_AC_W:-30}"   # → high, AC only
+readonly GPU_POWER_MAX_ON_AC_W="${GPU_POWER_MAX_ON_AC_W:-30}"
 
-readonly AC_UP_STATE1_CPU_C="${AC_UP_STATE1_CPU_C:-55}"   # → low
-readonly AC_UP_STATE1_GPU_C="${AC_UP_STATE1_GPU_C:-55}"
-readonly AC_UP_STATE2_CPU_C="${AC_UP_STATE2_CPU_C:-75}"   # → high
-readonly AC_UP_STATE2_GPU_C="${AC_UP_STATE2_GPU_C:-72}"
-readonly AC_DOWN_STATE0_CPU_C="${AC_DOWN_STATE0_CPU_C:-50}"  # low→off
-readonly AC_DOWN_STATE0_GPU_C="${AC_DOWN_STATE0_GPU_C:-50}"
-readonly AC_DOWN_STATE1_CPU_C="${AC_DOWN_STATE1_CPU_C:-70}"  # high→low
-readonly AC_DOWN_STATE1_GPU_C="${AC_DOWN_STATE1_GPU_C:-67}"
+readonly AC_UP_STATE1_CPU_C="${AC_UP_STATE1_CPU_C:-50}"   # Lowered from 55 for early LOW
+readonly AC_UP_STATE1_GPU_C="${AC_UP_STATE1_GPU_C:-50}"
+readonly AC_UP_STATE2_CPU_C="${AC_UP_STATE2_CPU_C:-72}"   # Lowered from 75 for early HIGH
+readonly AC_UP_STATE2_GPU_C="${AC_UP_STATE2_GPU_C:-70}"
+readonly AC_DOWN_STATE0_CPU_C="${AC_DOWN_STATE0_CPU_C:-48}"
+readonly AC_DOWN_STATE0_GPU_C="${AC_DOWN_STATE0_GPU_C:-48}"
+readonly AC_DOWN_STATE1_CPU_C="${AC_DOWN_STATE1_CPU_C:-68}"  # Lowered from 70
+readonly AC_DOWN_STATE1_GPU_C="${AC_DOWN_STATE1_GPU_C:-65}"
 
-readonly BAT_UP_STATE1_CPU_C="${BAT_UP_STATE1_CPU_C:-58}"  # → low
-readonly BAT_UP_STATE1_GPU_C="${BAT_UP_STATE1_GPU_C:-58}"
-readonly BAT_UP_STATE2_CPU_C="${BAT_UP_STATE2_CPU_C:-75}"  # → high
+readonly BAT_UP_STATE1_CPU_C="${BAT_UP_STATE1_CPU_C:-55}"
+readonly BAT_UP_STATE1_GPU_C="${BAT_UP_STATE1_GPU_C:-55}"
+readonly BAT_UP_STATE2_CPU_C="${BAT_UP_STATE2_CPU_C:-75}"
 readonly BAT_UP_STATE2_GPU_C="${BAT_UP_STATE2_GPU_C:-72}"
-readonly BAT_DOWN_STATE0_CPU_C="${BAT_DOWN_STATE0_CPU_C:-52}"  # low→off
+readonly BAT_DOWN_STATE0_CPU_C="${BAT_DOWN_STATE0_CPU_C:-52}"
 readonly BAT_DOWN_STATE0_GPU_C="${BAT_DOWN_STATE0_GPU_C:-52}"
-readonly BAT_DOWN_STATE1_CPU_C="${BAT_DOWN_STATE1_CPU_C:-70}"  # high→low
+readonly BAT_DOWN_STATE1_CPU_C="${BAT_DOWN_STATE1_CPU_C:-70}"
 readonly BAT_DOWN_STATE1_GPU_C="${BAT_DOWN_STATE1_GPU_C:-67}"
 
 readonly CPU_SENSOR_LABEL="${CPU_SENSOR_LABEL:-Tctl}"
@@ -354,9 +354,17 @@ desired_state() {
     local low_ready="${11}"
 
     # Emergency: always max, bypasses dwell and step-through
-    if (( cpu_c >= CPU_EMERGENCY_C || gpu_c >= GPU_EMERGENCY_C || wifi_c >= WIFI_GUARDRAIL_C )); then
+    if (( cpu_c >= CPU_EMERGENCY_C || gpu_c >= CPU_EMERGENCY_C || wifi_c >= WIFI_GUARDRAIL_C )); then
         printf '%s\n' "$max_state"
         return 0
+    fi
+
+    # Quiet profile override: fans OFF unless in danger zone (> 75)
+    if [[ "$platform_profile" == "quiet" ]]; then
+        if (( cpu_c <= 75 && gpu_c <= 75 )); then
+            printf '0\n'
+            return 0
+        fi
     fi
 
     local up1_cpu up1_gpu up2_cpu up2_gpu down0_cpu down0_gpu down1_cpu down1_gpu
@@ -379,10 +387,10 @@ desired_state() {
     if (( cpu_c >= up1_cpu || gpu_c >= up1_gpu )); then
         wants_low=1
     fi
-    if [[ "$platform_profile" == "performance" ]]; then
+    if [[ "$platform_profile" == "performance" || "$platform_profile" == "balanced" ]]; then
         if (( cpu_c >= MEDIUM_UP_CPU_C || gpu_c >= MEDIUM_UP_GPU_C || gpu_w >= MEDIUM_UP_GPU_W )); then
             wants_medium=1
-        elif (( current_state == 3 )) && (( cpu_c >= MEDIUM_DOWN_CPU_C || gpu_c >= MEDIUM_DOWN_GPU_C || gpu_w >= MEDIUM_DOWN_GPU_W )); then
+        elif (( current_state == 3 || current_state == 2 )) && (( cpu_c >= MEDIUM_DOWN_CPU_C || gpu_c >= MEDIUM_DOWN_GPU_C || gpu_w >= MEDIUM_DOWN_GPU_W )); then
             wants_medium=1
         fi
     fi
@@ -421,7 +429,7 @@ desired_state() {
         1)  # LOW: can go to HIGH only after dwell period
             if (( wants_high && low_dwell_met )); then
                 printf '%s\n' "$(clamp_state 2)"
-            elif (( wants_medium && low_ready )); then
+            elif (( wants_medium )); then
                 printf '3\n'
             elif (( cpu_c <= down0_cpu && gpu_c <= down0_gpu )); then
                 printf '0\n'
@@ -439,7 +447,9 @@ desired_state() {
             fi
             ;;
         *)  # HIGH: cool down when temps drop
-            if (( cpu_c <= down1_cpu && gpu_c <= down1_gpu && (on_ac == 0 || gpu_w < GPU_POWER_MAX_ON_AC_W) )); then
+            if (( wants_high )); then
+                printf '%s\n' "$(clamp_state 2)"
+            elif (( cpu_c <= down1_cpu && gpu_c <= down1_gpu && (on_ac == 0 || gpu_w < GPU_POWER_MAX_ON_AC_W) )); then
                 if (( wants_medium )); then
                     printf '3\n'
                 else
@@ -519,9 +529,6 @@ main() {
             sleep "$POLL_INTERVAL_SECONDS"
             continue
         fi
-
-        gpu_power_raw="$(read_power_value_microwatts "amdgpu" "$GPU_POWER_LABEL" 2>/dev/null || printf '0\n')"
-        wifi_raw="$(read_wifi_temp_millideg 2>/dev/null || printf '0\n')"
 
         cpu_c="$(to_celsius_int "$cpu_raw")"
         gpu_c="$(to_celsius_int "$gpu_raw")"
@@ -659,7 +666,9 @@ main() {
         if (( last_summary_epoch == 0 )); then
             last_summary_epoch="$now"
         elif (( now - last_summary_epoch >= summary_interval_ms )); then
-            log "summary samples=${summary_samples} avg_cpu=$(( sum_cpu / summary_samples ))C avg_gpu=$(( sum_gpu / summary_samples ))C avg_gpu_ppt=$(( sum_gpu_w / summary_samples ))W avg_rpm=$(( sum_rpm / summary_samples )) states=off:${state0_samples},low:${state1_samples},high:${state2_samples},med:${state3_samples} mismatch_events=${mismatch_events} recoveries=${recovery_events}"
+            if (( summary_samples > 0 )); then
+                log "summary samples=${summary_samples} avg_cpu=$(( sum_cpu / summary_samples ))C avg_gpu=$(( sum_gpu / summary_samples ))C avg_gpu_ppt=$(( sum_gpu_w / summary_samples ))W avg_rpm=$(( sum_rpm / summary_samples )) states=off:${state0_samples},low:${state1_samples},high:${state2_samples},med:${state3_samples} mismatch_events=${mismatch_events} recoveries=${recovery_events}"
+            fi
             last_summary_epoch="$now"
             summary_samples=0
             sum_cpu=0
