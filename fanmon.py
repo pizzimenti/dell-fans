@@ -15,9 +15,6 @@ import time
 
 HWMON_BASE = "/sys/class/hwmon"
 THERMAL_BASE = "/sys/class/thermal"
-PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
-PLATFORM_PROFILE_CHOICES = "/sys/firmware/acpi/platform_profile_choices"
-
 
 def _read(path: str, default="") -> str:
     try:
@@ -59,33 +56,12 @@ def find_cooling_device(dev_type: str) -> str | None:
 
 # Fan levels: 0=OFF  1=LOW  2=HIGH
 # Must stay in sync with dell-fan-policy.sh
-POLICY = {
-    "ac": {
-        "up1_cpu":    50,  "up1_gpu":    50,   # →LOW
-        "up2_cpu":    80,  "up2_gpu":    78,   # →HIGH
-        "down0_cpu":  50,  "down0_gpu":  50,   # LOW→OFF
-        "down1_cpu":  66,  "down1_gpu":  66,   # MED/HIGH→LOW band floor
-    },
-    "bat": {
-        "up1_cpu":    55,  "up1_gpu":    55,   # →LOW
-        "up2_cpu":    82,  "up2_gpu":    80,   # →HIGH
-        "down0_cpu":  52,  "down0_gpu":  52,   # LOW→OFF
-        "down1_cpu":  66,  "down1_gpu":  66,   # MED/HIGH→LOW band floor
-    },
-}
-MEDIUM_UP_CPU_C      = 68
-MEDIUM_UP_GPU_C      = 64
-MEDIUM_UP_GPU_W      = 16
-MEDIUM_DOWN_CPU_C    = 66
-MEDIUM_DOWN_GPU_C    = 66
-MEDIUM_DOWN_GPU_W    = 12
-GPU_POWER_MAX_AC_W = 40    # → HIGH, AC only
-HIGH_ENTRY_CPU_MARGIN_C = 2
-HIGH_ENTRY_GPU_MARGIN_C = 2
-HIGH_ENTRY_GPU_W_MARGIN = 5
-CPU_EMERGENCY_C     = 82
-GPU_EMERGENCY_C     = 80
-WIFI_GUARDRAIL_C    = 80
+LOW_ON_TEMP_C   = 50
+LOW_OFF_TEMP_C  = 48
+MEDIUM_ON_TEMP_C = 60
+HIGH_ON_TEMP_C   = 70
+HIGH_AFTER_MEDIUM_MS = 5_000
+ANY_TEMP_GUARDRAIL_C = 80
 LOW_SETTLED_RPM_MARGIN = 500
 LOW_MISMATCH_RPM_MARGIN = 1500
 
@@ -97,13 +73,6 @@ FAN_LEVEL_DOTS   = {
     2: "●●●",
 }
 PWM_ENABLE_NAMES = {0: "off", 1: "manual", 2: "auto (native)", 3: "auto (BIOS)"}
-
-PROFILE_DESC = {
-    "cool":        "aggressive cooling",
-    "quiet":       "prefer silence",
-    "balanced":    "default",
-    "performance": "max CPU/GPU",
-}
 
 
 def ensure_root_or_reexec() -> None:
@@ -119,24 +88,6 @@ def ensure_root_or_reexec() -> None:
         *sys.argv[1:],
     ]
     os.execvp("sudo", argv)
-
-
-# ── AC power detection (mirrors is_on_ac_power in dell-fan-policy.sh) ────────
-
-def is_on_ac() -> bool:
-    for ps in os.listdir("/sys/class/power_supply"):
-        base = f"/sys/class/power_supply/{ps}"
-        ptype = _read(f"{base}/type")
-        if ptype == "Battery":
-            status = _read(f"{base}/status")
-            if status in ("Charging", "Full", "Not charging"):
-                return True
-            if status == "Discharging":
-                return False
-        elif ptype in ("Mains", "USB"):
-            if _read(f"{base}/online") == "1":
-                return True
-    return False
 
 
 # ── policy telemetry reader (parses last telemetry line from journal) ───────
@@ -226,6 +177,7 @@ def collect() -> dict:
         data["fan_level_max"] = 2
         data["hw_level"]      = -1
     data["cmd_state"] = int(telemetry.get("cmd_state", data["hw_level"]))
+    data["medium_elapsed_ms"] = int(telemetry.get("medium_elapsed_ms", "0") or 0)
 
     # ── discrepancy detection ───────────────────────────────────────────────
     discrepancies = []
@@ -260,24 +212,15 @@ def collect() -> dict:
         )
     data["discrepancies"] = discrepancies
 
-    # ── platform power profile ─────────────────────────────────────────────
-    data["power_profile"]         = _read(PLATFORM_PROFILE, "unknown")
-    data["power_profile_choices"] = _read(PLATFORM_PROFILE_CHOICES, "").split()
-
     # ── policy sensor inputs (same sources as dell-fan-policy.sh) ─────────
-    data["on_ac"]       = is_on_ac()
     k10 = find_hwmon("k10temp")
     data["cpu_c"] = _read_int(f"{k10}/temp1_input") / 1000.0 if k10 else 0.0
 
     amdgpu = find_hwmon("amdgpu")
     if amdgpu:
         data["gpu_c"] = _read_int(f"{amdgpu}/temp1_input") / 1000.0
-        # Mirror the policy: prefer power1_average (stable), fall back to input
-        ppt_avg = _read_int(f"{amdgpu}/power1_average")
-        data["gpu_w"] = (ppt_avg if ppt_avg else _read_int(f"{amdgpu}/power1_input")) / 1_000_000.0
     else:
         data["gpu_c"] = 0.0
-        data["gpu_w"] = 0.0
 
     wifi = find_hwmon("mt7925_phy0")
     data["wifi_c"] = _read_int(f"{wifi}/temp1_input") / 1000.0 if wifi else 0.0
@@ -322,86 +265,56 @@ def _row(met, label, value, threshold, unit, note="", cool=False):
 def build_criteria(data: dict) -> list[dict]:
     cpu_c      = data["cpu_c"]
     gpu_c      = data["gpu_c"]
-    gpu_w      = data["gpu_w"]
     wifi_c     = data["wifi_c"]
-    on_ac      = data["on_ac"]
-    th         = POLICY["ac"] if on_ac else POLICY["bat"]
+    medium_elapsed_ms = data.get("medium_elapsed_ms", 0)
+    hottest    = max(cpu_c, gpu_c)
+    hottest_guardrail = max(cpu_c, gpu_c, wifi_c)
 
     sections = []
 
     # ── 0. Emergency ───────────────────────────────────────────────────────
     sections.append({
-        "header": "Emergency → HIGH (any)",
-        "logic": "any",
-        "rows": [
-            _row(cpu_c  >= CPU_EMERGENCY_C,  "CPU",  cpu_c,                     CPU_EMERGENCY_C,  "°C"),
-            _row(gpu_c  >= GPU_EMERGENCY_C,  "GPU",  gpu_c,                     GPU_EMERGENCY_C,  "°C"),
-            _row(wifi_c >= WIFI_GUARDRAIL_C, "WiFi", wifi_c if wifi_c else None, WIFI_GUARDRAIL_C, "°C", "guardrail"),
-        ],
-    })
-
-    # ── 1. OFF → LOW (step-through enforced; HIGH never skips LOW) ─────────
-    sections.append({
-        "header": "Ramp to LOW (any sufficient; OFF never skips to HIGH)",
-        "logic": "any",
-        "rows": [
-            _row(cpu_c >= th["up1_cpu"], "CPU", cpu_c, th["up1_cpu"], "°C"),
-            _row(gpu_c >= th["up1_gpu"], "GPU", gpu_c, th["up1_gpu"], "°C"),
-        ],
-    })
-
-    # ── 2. LOW/MED → MEDIUM (any sufficient) ───────────────────────────────
-    ramp_medium = [
-        _row(cpu_c >= MEDIUM_UP_CPU_C, "CPU", cpu_c, MEDIUM_UP_CPU_C, "°C"),
-        _row(gpu_c >= MEDIUM_UP_GPU_C, "GPU", gpu_c, MEDIUM_UP_GPU_C, "°C"),
-        _row(gpu_w >= MEDIUM_UP_GPU_W, "GPU power", gpu_w, MEDIUM_UP_GPU_W, "W"),
-    ]
-    sections.append({
-        "header": "Ramp to MEDIUM (any sufficient)",
-        "logic": "any",
-        "rows": ramp_medium,
-    })
-
-    # ── 3. MEDIUM → HIGH (overshoot required) ──────────────────────────────
-    ramp_high = [
-        _row(cpu_c >= th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "CPU", cpu_c, th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "°C"),
-        _row(gpu_c >= th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "GPU", gpu_c, th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "°C"),
-    ]
-    if on_ac:
-        ramp_high.append(_row(gpu_w >= GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "GPU power", gpu_w, GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "W", "AC only"))
-    sections.append({
-        "header": "Ramp to HIGH (overshoot; any sufficient)",
-        "logic": "any",
-        "rows": ramp_high,
-    })
-
-    # ── 4. HIGH → MEDIUM cool-down (leave hard-high band) ──────────────────
-    cd1 = [
-        _row(cpu_c < th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "CPU", cpu_c, th["up2_cpu"] + HIGH_ENTRY_CPU_MARGIN_C, "°C", cool=True),
-        _row(gpu_c < th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "GPU", gpu_c, th["up2_gpu"] + HIGH_ENTRY_GPU_MARGIN_C, "°C", cool=True),
-    ]
-    if on_ac:
-        cd1.append(_row(gpu_w < GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "GPU power", gpu_w, GPU_POWER_MAX_AC_W + HIGH_ENTRY_GPU_W_MARGIN, "W", "AC only", cool=True))
-    sections.append({"header": "Cool HIGH → MEDIUM (all required)", "logic": "all", "rows": cd1})
-
-    # ── 5. MEDIUM → LOW cool-down (all required) ───────────────────────────
-    sections.append({
-        "header": "Cool MEDIUM → LOW (all required)",
+        "header": "Guardrail → HIGH",
         "logic": "all",
         "rows": [
-            _row(cpu_c < MEDIUM_DOWN_CPU_C, "CPU", cpu_c, MEDIUM_DOWN_CPU_C, "°C", cool=True),
-            _row(gpu_c < MEDIUM_DOWN_GPU_C, "GPU", gpu_c, MEDIUM_DOWN_GPU_C, "°C", cool=True),
-            _row(gpu_w < MEDIUM_DOWN_GPU_W, "GPU power", gpu_w, MEDIUM_DOWN_GPU_W, "W", cool=True),
+            _row(hottest_guardrail >= ANY_TEMP_GUARDRAIL_C,
+                 "Any temp", hottest_guardrail, ANY_TEMP_GUARDRAIL_C, "°C"),
         ],
     })
 
-    # ── 6. LOW → OFF cool-down (all required) ──────────────────────────────
+    # ── 1. OFF/LOW band ────────────────────────────────────────────────────
     sections.append({
-        "header": "Cool LOW → OFF (all required)",
+        "header": "LOW band (50C-59C)",
+        "logic": "any",
+        "rows": [
+            _row(hottest >= LOW_ON_TEMP_C, "Hottest temp", hottest, LOW_ON_TEMP_C, "°C"),
+        ],
+    })
+
+    sections.append({
+        "header": "MEDIUM band (60C-69C)",
         "logic": "all",
         "rows": [
-            _row(cpu_c <= th["down0_cpu"], "CPU", cpu_c, th["down0_cpu"], "°C", cool=True),
-            _row(gpu_c <= th["down0_gpu"], "GPU", gpu_c, th["down0_gpu"], "°C", cool=True),
+            _row(hottest >= MEDIUM_ON_TEMP_C, "Hottest temp", hottest, MEDIUM_ON_TEMP_C, "°C"),
+            _row(hottest < HIGH_ON_TEMP_C, "Hottest temp", hottest, HIGH_ON_TEMP_C, "°C", cool=True),
+        ],
+    })
+
+    sections.append({
+        "header": "HIGH band (70C+ after 5s in MEDIUM)",
+        "logic": "all",
+        "rows": [
+            _row(hottest >= HIGH_ON_TEMP_C, "Hottest temp", hottest, HIGH_ON_TEMP_C, "°C"),
+            _row(medium_elapsed_ms >= HIGH_AFTER_MEDIUM_MS,
+                 "Medium hold", medium_elapsed_ms / 1000.0, HIGH_AFTER_MEDIUM_MS / 1000.0, "s"),
+        ],
+    })
+
+    sections.append({
+        "header": "LOW → OFF cooldown",
+        "logic": "all",
+        "rows": [
+            _row(hottest <= LOW_OFF_TEMP_C, "Hottest temp", hottest, LOW_OFF_TEMP_C, "°C", cool=True),
         ],
     })
 
@@ -474,8 +387,6 @@ def draw(stdscr, data: dict, interval: float):
     level_name = FAN_LEVEL_NAMES.get(level, f"L{level}")
     fan_rpm    = data["fan_rpm"]
     fan_max    = data["fan_max"]
-    src_str    = "AC" if data["on_ac"] else "battery"
-    profile    = data["power_profile"]
 
     # ── title ─────────────────────────────────────────────────────────────
     safe_addstr(stdscr, row, 0,
@@ -484,7 +395,7 @@ def draw(stdscr, data: dict, interval: float):
     row += 1
     safe_addstr(stdscr, row, 0,
                 f" {time.strftime('%H:%M:%S')}  refresh {interval:.0f}s"
-                f"   q quit  +/- interval  p profile  r refresh now",
+                f"   q quit  +/- interval  r refresh now",
                 curses.color_pair(COLOR_DIM))
     row += 2
 
@@ -530,28 +441,13 @@ def draw(stdscr, data: dict, interval: float):
 
     row += 1
 
-    # ── fan driver ────────────────────────────────────────────────────────
-    safe_addstr(stdscr, row, 0, "  FAN DRIVER", curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
-    choices = data["power_profile_choices"]
-    parts   = [f"[{c.upper()}]" if c == profile else c for c in choices]
-    p_attr  = curses.color_pair(COLOR_WARN) if profile == "performance" else curses.color_pair(COLOR_GOOD)
-    col = 14
-    safe_addstr(stdscr, row, col, f"{src_str}  ", curses.color_pair(COLOR_DIM))
-    col += len(src_str) + 2
-    safe_addstr(stdscr, row, col, "  ".join(parts), p_attr)
-    col += len("  ".join(parts)) + 2
+    # ── policy bands ──────────────────────────────────────────────────────
+    safe_addstr(stdscr, row, 0, "  POLICY BANDS", curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
     safe_addstr(stdscr, row, 0, "  " + "─" * min(max_x - 4, 62), curses.color_pair(COLOR_DIM))
     row += 1
 
-    # Show only the section gating the NEXT upward transition.
-    # Index map: 0=emergency, 1=ramp_low, 2=ramp_high, 3=cool_high_low, 4=cool_low_off
     all_sections = build_criteria(data)
-    if level == 0:
-        show_idxs = [1]   # what triggers LOW (HIGH is blocked by step-through anyway)
-    elif level in (1, 3):
-        show_idxs = [2]   # what gates HIGH (temps + power)
-    else:
-        show_idxs = [3]   # when HIGH will drop back to LOW
+    show_idxs = [1, 2, 3, 4]
 
     for idx in show_idxs:
         if row >= max_y - 5:
@@ -562,10 +458,7 @@ def draw(stdscr, data: dict, interval: float):
         any_met = any(r["met"] for r in rows)
         all_met = all(r["met"] for r in rows)
 
-        if logic == "all_for_high":
-            # HIGH requires ALL conditions (temps + power)
-            active = all_met
-        elif logic == "any":
+        if logic == "any":
             active = any_met
         else:
             active = all_met
@@ -661,40 +554,11 @@ def draw(stdscr, data: dict, interval: float):
             draw_bar(stdscr, row, bar_col, bar_w, min(1.0, tc / 100.0))
             row += 1
 
-        gpu_w = data.get("gpu_w", 0)
-        if gpu_w and row < max_y - 2:
-            gpu_attr = curses.color_pair(COLOR_WARN) if gpu_w >= GPU_POWER_MAX_AC_W * 0.5 else curses.color_pair(COLOR_GOOD)
-            safe_addstr(stdscr, row, 4,       f"{'GPU power':<16}", curses.color_pair(COLOR_DIM))
-            safe_addstr(stdscr, row, val_col, f"{gpu_w:5.1f} W ", gpu_attr)
-            draw_bar(stdscr, row, bar_col, bar_w, min(1.0, gpu_w / GPU_POWER_MAX_AC_W))
-            row += 1
-
     # ── footer ────────────────────────────────────────────────────────────
     safe_addstr(stdscr, max_y - 1, 0,
-                " q quit | +/- interval | p cycle power profile | r refresh now ".ljust(max_x - 1),
+                " q quit | +/- interval | r refresh now ".ljust(max_x - 1),
                 curses.color_pair(COLOR_TITLE))
     stdscr.refresh()
-
-
-# ── profile cycling ───────────────────────────────────────────────────────────
-
-def set_power_profile(profile: str) -> bool:
-    try:
-        with open(PLATFORM_PROFILE, "w") as f:
-            f.write(profile)
-        return True
-    except PermissionError:
-        return False
-
-
-def cycle_profile(current: str, choices: list[str]) -> str | None:
-    if not choices:
-        return None
-    try:
-        idx = choices.index(current)
-    except ValueError:
-        idx = 0
-    return choices[(idx + 1) % len(choices)]
 
 
 # ── main loop ─────────────────────────────────────────────────────────────────
@@ -708,8 +572,6 @@ def main(stdscr):
     interval        = 2.0
     last_update     = 0.0
     data            = {}
-    profile_error   = False
-    profile_error_ts = 0.0
 
     while True:
         now = time.monotonic()
@@ -720,13 +582,6 @@ def main(stdscr):
         if data:
             draw(stdscr, data, interval)
 
-        if profile_error and time.monotonic() - profile_error_ts < 3:
-            max_y, max_x = stdscr.getmaxyx()
-            safe_addstr(stdscr, max_y - 2, 2,
-                        " Unable to change power profile ",
-                        curses.color_pair(COLOR_HOT) | curses.A_BOLD)
-            stdscr.refresh()
-
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             break
@@ -736,15 +591,6 @@ def main(stdscr):
             interval = max(0.5, interval - 0.5)
         elif key in (ord("r"), ord("R")):
             last_update = 0
-        elif key in (ord("p"), ord("P")) and data:
-            next_p = cycle_profile(data["power_profile"], data["power_profile_choices"])
-            if next_p:
-                ok = set_power_profile(next_p)
-                if ok:
-                    last_update = 0
-                else:
-                    profile_error    = True
-                    profile_error_ts = time.monotonic()
 
 
 if __name__ == "__main__":

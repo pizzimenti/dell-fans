@@ -7,10 +7,11 @@ set -euo pipefail
 # and stepped manual fan levels via pwm1 or a thermal cooling_device.
 #
 # Policy:
-# - CPU and GPU temperatures are primary inputs.
-# - GPU package power can force a higher state on AC.
-# - Wi-Fi temperature is guardrail-only and does not affect normal fan states.
-# - Fan now responds directly to temperature/power without enforced dwell periods.
+# - Fan state is driven only by CPU and GPU temperatures.
+# - Wi-Fi temperature is guardrail-only and can still force HIGH.
+# - LOW is the warm baseline, MEDIUM covers 60C-69C, and HIGH starts at 70C.
+# - HIGH requires 5 seconds already spent in MEDIUM unless the 80C guardrail trips.
+# - No AC/battery logic, profile logic, trend detection, or power-based escalation.
 
 readonly POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-0.5}"
 readonly LOW_SETTLED_RPM_MARGIN="${LOW_SETTLED_RPM_MARGIN:-500}"                  # LOW timers start only after RPM is near target
@@ -18,51 +19,23 @@ readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"             
 readonly MISMATCH_RECOVERY_POLLS="${MISMATCH_RECOVERY_POLLS:-3}"                  # consecutive mismatch polls before corrective action
 readonly MISMATCH_RECOVERY_COOLDOWN_SECONDS="${MISMATCH_RECOVERY_COOLDOWN_SECONDS:-20}"
 readonly MISMATCH_RECOVERY_SETTLE_SECONDS="${MISMATCH_RECOVERY_SETTLE_SECONDS:-1}"
-readonly MEDIUM_UP_CPU_C="${MEDIUM_UP_CPU_C:-68}"
-readonly MEDIUM_UP_GPU_C="${MEDIUM_UP_GPU_C:-64}"
-readonly MEDIUM_UP_GPU_W="${MEDIUM_UP_GPU_W:-16}"
-readonly MEDIUM_DOWN_CPU_C="${MEDIUM_DOWN_CPU_C:-66}"
-readonly MEDIUM_DOWN_GPU_C="${MEDIUM_DOWN_GPU_C:-66}"
-readonly MEDIUM_DOWN_GPU_W="${MEDIUM_DOWN_GPU_W:-12}"
-readonly MEDIUM_HIGH_SLOT_EVERY="${MEDIUM_HIGH_SLOT_EVERY:-3}"
+readonly MEDIUM_HIGH_SLOT_EVERY="${MEDIUM_HIGH_SLOT_EVERY:-2}"
+readonly HIGH_AFTER_MEDIUM_SECONDS="${HIGH_AFTER_MEDIUM_SECONDS:-5}"
 readonly SUMMARY_INTERVAL_SECONDS="${SUMMARY_INTERVAL_SECONDS:-60}"
-readonly WIFI_GUARDRAIL_C="${WIFI_GUARDRAIL_C:-80}"
-readonly CPU_EMERGENCY_C="${CPU_EMERGENCY_C:-82}"
-readonly GPU_EMERGENCY_C="${GPU_EMERGENCY_C:-80}"
+readonly ANY_TEMP_GUARDRAIL_C="${ANY_TEMP_GUARDRAIL_C:-80}"
+readonly LOW_ON_TEMP_C="${LOW_ON_TEMP_C:-50}"
+readonly LOW_OFF_TEMP_C="${LOW_OFF_TEMP_C:-48}"
+readonly MEDIUM_ON_TEMP_C="${MEDIUM_ON_TEMP_C:-60}"
+readonly HIGH_ON_TEMP_C="${HIGH_ON_TEMP_C:-70}"
 # Fan levels: 0=OFF  1=LOW  2=HIGH
-readonly GPU_POWER_MAX_ON_AC_W="${GPU_POWER_MAX_ON_AC_W:-40}"
-readonly HIGH_ENTRY_CPU_MARGIN_C="${HIGH_ENTRY_CPU_MARGIN_C:-2}"
-readonly HIGH_ENTRY_GPU_MARGIN_C="${HIGH_ENTRY_GPU_MARGIN_C:-2}"
-readonly HIGH_ENTRY_GPU_W_MARGIN="${HIGH_ENTRY_GPU_W_MARGIN:-5}"
-
-readonly AC_UP_STATE1_CPU_C="${AC_UP_STATE1_CPU_C:-50}"   # Lowered from 55 for early LOW
-readonly AC_UP_STATE1_GPU_C="${AC_UP_STATE1_GPU_C:-50}"
-readonly AC_UP_STATE2_CPU_C="${AC_UP_STATE2_CPU_C:-80}"
-readonly AC_UP_STATE2_GPU_C="${AC_UP_STATE2_GPU_C:-78}"
-readonly AC_DOWN_STATE0_CPU_C="${AC_DOWN_STATE0_CPU_C:-48}"
-readonly AC_DOWN_STATE0_GPU_C="${AC_DOWN_STATE0_GPU_C:-48}"
-readonly AC_DOWN_STATE1_CPU_C="${AC_DOWN_STATE1_CPU_C:-66}"
-readonly AC_DOWN_STATE1_GPU_C="${AC_DOWN_STATE1_GPU_C:-66}"
-
-readonly BAT_UP_STATE1_CPU_C="${BAT_UP_STATE1_CPU_C:-55}"
-readonly BAT_UP_STATE1_GPU_C="${BAT_UP_STATE1_GPU_C:-55}"
-readonly BAT_UP_STATE2_CPU_C="${BAT_UP_STATE2_CPU_C:-82}"
-readonly BAT_UP_STATE2_GPU_C="${BAT_UP_STATE2_GPU_C:-80}"
-readonly BAT_DOWN_STATE0_CPU_C="${BAT_DOWN_STATE0_CPU_C:-52}"
-readonly BAT_DOWN_STATE0_GPU_C="${BAT_DOWN_STATE0_GPU_C:-52}"
-readonly BAT_DOWN_STATE1_CPU_C="${BAT_DOWN_STATE1_CPU_C:-66}"
-readonly BAT_DOWN_STATE1_GPU_C="${BAT_DOWN_STATE1_GPU_C:-66}"
 
 readonly CPU_SENSOR_LABEL="${CPU_SENSOR_LABEL:-Tctl}"
 readonly GPU_SENSOR_LABEL="${GPU_SENSOR_LABEL:-edge}"
-readonly GPU_POWER_LABEL="${GPU_POWER_LABEL:-PPT}"
 readonly WIFI_SENSOR_GLOB="${WIFI_SENSOR_GLOB:-mt*_phy*-pci-*}"
 
 hwmon_dir=""
 control_file=""
 max_state=0
-platform_profile_path="/sys/firmware/acpi/platform_profile"
-
 log() {
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
@@ -74,11 +47,6 @@ now_ms() {
 seconds_to_ms() {
     local seconds="$1"
     printf '%s\n' $(( seconds * 1000 ))
-}
-
-format_tenths_s() {
-    local ms="$1"
-    printf '%d.%01d' $(( ms / 1000 )) $(( (ms % 1000) / 100 ))
 }
 
 read_first_line() {
@@ -218,31 +186,6 @@ read_sensor_value_millideg() {
     return 1
 }
 
-read_power_value_microwatts() {
-    local sensor_name="$1"
-    local label="$2"
-    local dir label_path input_path avg_path
-
-    for dir in /sys/class/hwmon/hwmon*; do
-        [[ -d "$dir" ]] || continue
-        if [[ "$(read_first_line "$dir/name" 2>/dev/null || true)" != "$sensor_name" ]]; then
-            continue
-        fi
-        for label_path in "$dir"/power*_label; do
-            [[ -e "$label_path" ]] || continue
-            if [[ "$(read_first_line "$label_path" 2>/dev/null || true)" == "$label" ]]; then
-                input_path="${label_path%_label}_input"
-                avg_path="${label_path%_label}_average"
-                if [[ -r "$avg_path" ]]; then
-                    read_first_line "$avg_path" 2>/dev/null && return 0
-                fi
-                read_first_line "$input_path" 2>/dev/null && return 0
-            fi
-        done
-    done
-    return 1
-}
-
 read_wifi_temp_millideg() {
     local dir
     for dir in /sys/class/hwmon/hwmon*; do
@@ -256,45 +199,9 @@ read_wifi_temp_millideg() {
     return 1
 }
 
-is_on_ac_power() {
-    local battery_dir battery_status
-    for battery_dir in /sys/class/power_supply/*; do
-        [[ -d "$battery_dir" ]] || continue
-        [[ "$(read_first_line "$battery_dir/type" 2>/dev/null || true)" == "Battery" ]] || continue
-        battery_status="$(read_first_line "$battery_dir/status" 2>/dev/null || true)"
-        case "$battery_status" in
-            Charging|Full|Not\ charging)
-                return 0
-                ;;
-            Discharging)
-                return 1
-                ;;
-        esac
-    done
-
-    local ps
-    for ps in /sys/class/power_supply/*; do
-        [[ -d "$ps" ]] || continue
-        case "$(read_first_line "$ps/type" 2>/dev/null || true)" in
-            Mains)
-                [[ "$(read_first_line "$ps/online" 2>/dev/null || true)" == "1" ]] && return 0
-                ;;
-            USB)
-                [[ "$(read_first_line "$ps/online" 2>/dev/null || true)" == "1" ]] && return 0
-                ;;
-        esac
-    done
-    return 1
-}
-
 to_celsius_int() {
     local raw="$1"
     printf '%s\n' $(( raw / 1000 ))
-}
-
-to_watts_int() {
-    local raw="$1"
-    printf '%s\n' $(( raw / 1000000 ))
 }
 
 read_fan_rpm() {
@@ -317,10 +224,6 @@ read_hw_fan_state() {
     fi
 }
 
-read_platform_profile() {
-    read_first_line "$platform_profile_path" 2>/dev/null || printf 'balanced\n'
-}
-
 is_low_fan_mismatch() {
     local rpm="$1"
     local target="$2"
@@ -332,98 +235,44 @@ desired_state() {
     local current_state="$1"
     local cpu_c="$2"
     local gpu_c="$3"
-    local gpu_w="$4"
-    local wifi_c="$5"
-    local on_ac="$6"
-    local cpu_prev_c="$7"
-    local gpu_prev_c="$8"
-    local platform_profile="${9}"
+    local wifi_c="$4"
+    local medium_elapsed_ms="${5:-0}"
+    local hottest_temp
+    local hottest_guardrail_temp
 
-    # Emergency: always max, bypasses dwell and step-through
-    if (( cpu_c >= CPU_EMERGENCY_C || gpu_c >= CPU_EMERGENCY_C || wifi_c >= WIFI_GUARDRAIL_C )); then
+    hottest_temp="$cpu_c"
+    if (( gpu_c > hottest_temp )); then
+        hottest_temp="$gpu_c"
+    fi
+    hottest_guardrail_temp="$hottest_temp"
+    if (( wifi_c > hottest_guardrail_temp )); then
+        hottest_guardrail_temp="$wifi_c"
+    fi
+
+    # Guardrail: any reported temperature at or above the hard limit forces HIGH.
+    if (( hottest_guardrail_temp >= ANY_TEMP_GUARDRAIL_C )); then
         printf '%s\n' "$max_state"
         return 0
     fi
 
-    # Quiet profile override: fans OFF unless in danger zone (> 75)
-    if [[ "$platform_profile" == "quiet" ]]; then
-        if (( cpu_c <= 75 && gpu_c <= 75 )); then
-            printf '0\n'
-            return 0
-        fi
-    fi
-
-    local up1_cpu up1_gpu up2_cpu up2_gpu down0_cpu down0_gpu down1_cpu down1_gpu
-    if (( on_ac == 1 )); then
-        up1_cpu="$AC_UP_STATE1_CPU_C";   up1_gpu="$AC_UP_STATE1_GPU_C"
-        up2_cpu="$AC_UP_STATE2_CPU_C";   up2_gpu="$AC_UP_STATE2_GPU_C"
-        down0_cpu="$AC_DOWN_STATE0_CPU_C"; down0_gpu="$AC_DOWN_STATE0_GPU_C"
-        down1_cpu="$AC_DOWN_STATE1_CPU_C"; down1_gpu="$AC_DOWN_STATE1_GPU_C"
+    # Temperature bands:
+    # - 70C and up: HIGH, but only after 5s already spent in MEDIUM
+    # - 60C to 69C: MEDIUM
+    # - 50C to 59C: LOW
+    # - 48C and below: OFF
+    if (( hottest_temp >= HIGH_ON_TEMP_C && medium_elapsed_ms >= HIGH_AFTER_MEDIUM_SECONDS * 1000 )); then
+        printf '%s\n' "$(clamp_state 2)"
+    elif (( hottest_temp >= MEDIUM_ON_TEMP_C )); then
+        printf '3\n'
+    elif (( hottest_temp >= LOW_ON_TEMP_C )); then
+        printf '1\n'
+    elif (( hottest_temp <= LOW_OFF_TEMP_C )); then
+        printf '0\n'
+    elif (( current_state == 0 )); then
+        printf '0\n'
     else
-        up1_cpu="$BAT_UP_STATE1_CPU_C";  up1_gpu="$BAT_UP_STATE1_GPU_C"
-        up2_cpu="$BAT_UP_STATE2_CPU_C";  up2_gpu="$BAT_UP_STATE2_GPU_C"
-        down0_cpu="$BAT_DOWN_STATE0_CPU_C"; down0_gpu="$BAT_DOWN_STATE0_GPU_C"
-        down1_cpu="$BAT_DOWN_STATE1_CPU_C"; down1_gpu="$BAT_DOWN_STATE1_GPU_C"
+        printf '1\n'
     fi
-
-    local wants_high=0 wants_low=0 wants_medium=0 hard_high=0
-    if (( cpu_c >= up2_cpu || gpu_c >= up2_gpu || (on_ac == 1 && gpu_w >= GPU_POWER_MAX_ON_AC_W) )); then
-        wants_high=1
-    fi
-    if (( cpu_c >= up1_cpu || gpu_c >= up1_gpu )); then
-        wants_low=1
-    fi
-    if [[ "$platform_profile" == "performance" || "$platform_profile" == "balanced" ]]; then
-        if (( cpu_c >= MEDIUM_UP_CPU_C || gpu_c >= MEDIUM_UP_GPU_C || gpu_w >= MEDIUM_UP_GPU_W )); then
-            wants_medium=1
-        elif (( current_state == 3 || current_state == 2 )) && (( cpu_c >= MEDIUM_DOWN_CPU_C || gpu_c >= MEDIUM_DOWN_GPU_C || gpu_w >= MEDIUM_DOWN_GPU_W )); then
-            wants_medium=1
-        fi
-    fi
-    if (( cpu_c >= up2_cpu + HIGH_ENTRY_CPU_MARGIN_C \
-       || gpu_c >= up2_gpu + HIGH_ENTRY_GPU_MARGIN_C \
-       || (on_ac == 1 && gpu_w >= GPU_POWER_MAX_ON_AC_W + HIGH_ENTRY_GPU_W_MARGIN) )); then
-        hard_high=1
-    fi
-
-    case "$current_state" in
-        0)  # OFF: step-through — can only go to LOW, never skip to HIGH
-            if (( wants_low || wants_high )); then
-                printf '1\n'
-            else
-                printf '0\n'
-            fi
-            ;;
-        1)  # LOW: always pass through MEDIUM before HIGH
-            if (( wants_medium || wants_high )); then
-                printf '3\n'
-            elif (( cpu_c <= down0_cpu && gpu_c <= down0_gpu )); then
-                printf '0\n'
-            else
-                printf '1\n'
-            fi
-            ;;
-        3)  # MED: synthetic medium using a LOW/HIGH duty cycle
-            if (( hard_high \
-               && (cpu_prev_c == 0 || gpu_prev_c == 0 || cpu_c >= cpu_prev_c || gpu_c >= gpu_prev_c) )); then
-                printf '%s\n' "$(clamp_state 2)"
-            elif (( wants_medium || wants_high )); then
-                printf '3\n'
-            else
-                printf '1\n'
-            fi
-            ;;
-        *)  # HIGH: cool down when temps drop
-            if (( hard_high \
-               && (cpu_prev_c == 0 || gpu_prev_c == 0 || (cpu_c >= cpu_prev_c && gpu_c >= gpu_prev_c)) )); then
-                printf '%s\n' "$(clamp_state 2)"
-            elif (( wants_medium || wants_high )); then
-                printf '3\n'
-            else
-                printf '1\n'
-            fi
-            ;;
-    esac
 }
 
 commanded_hw_state() {
@@ -431,6 +280,8 @@ commanded_hw_state() {
     local medium_phase="$2"
     case "$logical_state" in
         3)
+            # The hardware exposes only OFF/LOW/HIGH, so MEDIUM is synthesized
+            # as a repeating HIGH/LOW cadence.
             if (( medium_phase == 0 )); then
                 printf '%s\n' "$(clamp_state 2)"
             else
@@ -448,15 +299,13 @@ main() {
     trap 'restore_bios_auto' EXIT INT TERM HUP
     enable_manual_mode
 
-    local cpu_raw gpu_raw gpu_power_raw wifi_raw cpu_c gpu_c gpu_w wifi_c platform_profile
-    local prev_cpu_c=0 prev_gpu_c=0
+    local cpu_raw gpu_raw wifi_raw cpu_c gpu_c wifi_c
     local fan_rpm fan_target pwm_value hw_fan_state cmd_state last_cmd_state=-1 low_fan_mismatch=0
     local mismatch_polls=0 last_recovery_epoch=0 medium_phase=0
-    local on_ac current_state next_state
-    local last_change_epoch=0 now
+    local current_state next_state now medium_entered_epoch=0 medium_elapsed_ms=0
     local mismatch_recovery_cooldown_ms summary_interval_ms
     local last_summary_epoch=0 summary_samples=0 recovery_events=0 mismatch_events=0
-    local sum_cpu=0 sum_gpu=0 sum_gpu_w=0 sum_rpm=0 state0_samples=0 state1_samples=0 state2_samples=0 state3_samples=0
+    local sum_cpu=0 sum_gpu=0 sum_rpm=0 state0_samples=0 state1_samples=0 state2_samples=0 state3_samples=0
 
     mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
     summary_interval_ms="$(seconds_to_ms "$SUMMARY_INTERVAL_SECONDS")"
@@ -481,20 +330,11 @@ main() {
             continue
         fi
 
-        gpu_power_raw="$(read_power_value_microwatts "amdgpu" "$GPU_POWER_LABEL" 2>/dev/null || printf '0\n')"
         wifi_raw="$(read_wifi_temp_millideg 2>/dev/null || printf '0\n')"
 
         cpu_c="$(to_celsius_int "$cpu_raw")"
         gpu_c="$(to_celsius_int "$gpu_raw")"
-        gpu_w="$(to_watts_int "$gpu_power_raw")"
         wifi_c="$(to_celsius_int "$wifi_raw")"
-
-        if is_on_ac_power; then
-            on_ac=1
-        else
-            on_ac=0
-        fi
-        platform_profile="$(read_platform_profile)"
 
         fan_rpm="$(read_fan_rpm)"
         fan_target="$(read_fan_target)"
@@ -516,12 +356,28 @@ main() {
             mismatch_polls=0
         fi
 
-        next_state="$(desired_state "$current_state" "$cpu_c" "$gpu_c" "$gpu_w" "$wifi_c" "$on_ac" "$prev_cpu_c" "$prev_gpu_c" "$platform_profile")"
+        if (( current_state == 3 )); then
+            if (( medium_entered_epoch == 0 )); then
+                medium_entered_epoch="$now"
+            fi
+            medium_elapsed_ms=$(( now - medium_entered_epoch ))
+        else
+            medium_entered_epoch=0
+            medium_elapsed_ms=0
+        fi
+
+        next_state="$(desired_state "$current_state" "$cpu_c" "$gpu_c" "$wifi_c" "$medium_elapsed_ms")"
 
         if (( next_state != current_state )); then
             current_state="$next_state"
-            last_change_epoch="$now"
             medium_phase=0
+            if (( current_state == 3 )); then
+                medium_entered_epoch="$now"
+                medium_elapsed_ms=0
+            else
+                medium_entered_epoch=0
+                medium_elapsed_ms=0
+            fi
         fi
 
         cmd_state="$(commanded_hw_state "$current_state" "$medium_phase")"
@@ -552,7 +408,7 @@ main() {
             fi
         fi
 
-        log "telemetry ac=${on_ac} profile=${platform_profile} cpu=${cpu_c}C gpu=${gpu_c}C gpu_ppt=${gpu_w}W wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} low_mismatch=${low_fan_mismatch} mismatch_polls=${mismatch_polls}"
+        log "telemetry cpu=${cpu_c}C gpu=${gpu_c}C wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} medium_elapsed_ms=${medium_elapsed_ms} low_mismatch=${low_fan_mismatch} mismatch_polls=${mismatch_polls}"
         if (( low_fan_mismatch )); then
             log "WARNING: LOW mismatch hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value}"
             mismatch_events=$(( mismatch_events + 1 ))
@@ -560,7 +416,6 @@ main() {
         summary_samples=$(( summary_samples + 1 ))
         sum_cpu=$(( sum_cpu + cpu_c ))
         sum_gpu=$(( sum_gpu + gpu_c ))
-        sum_gpu_w=$(( sum_gpu_w + gpu_w ))
         sum_rpm=$(( sum_rpm + fan_rpm ))
         case "$current_state" in
             0) state0_samples=$(( state0_samples + 1 )) ;;
@@ -572,13 +427,12 @@ main() {
             last_summary_epoch="$now"
         elif (( now - last_summary_epoch >= summary_interval_ms )); then
             if (( summary_samples > 0 )); then
-                log "summary samples=${summary_samples} avg_cpu=$(( sum_cpu / summary_samples ))C avg_gpu=$(( sum_gpu / summary_samples ))C avg_gpu_ppt=$(( sum_gpu_w / summary_samples ))W avg_rpm=$(( sum_rpm / summary_samples )) states=off:${state0_samples},low:${state1_samples},high:${state2_samples},med:${state3_samples} mismatch_events=${mismatch_events} recoveries=${recovery_events}"
+                log "summary samples=${summary_samples} avg_cpu=$(( sum_cpu / summary_samples ))C avg_gpu=$(( sum_gpu / summary_samples ))C avg_rpm=$(( sum_rpm / summary_samples )) states=off:${state0_samples},low:${state1_samples},high:${state2_samples},med:${state3_samples} mismatch_events=${mismatch_events} recoveries=${recovery_events}"
             fi
             last_summary_epoch="$now"
             summary_samples=0
             sum_cpu=0
             sum_gpu=0
-            sum_gpu_w=0
             sum_rpm=0
             state0_samples=0
             state1_samples=0
@@ -587,8 +441,6 @@ main() {
             mismatch_events=0
             recovery_events=0
         fi
-        prev_cpu_c="$cpu_c"
-        prev_gpu_c="$gpu_c"
         sleep "$POLL_INTERVAL_SECONDS"
     done
 }

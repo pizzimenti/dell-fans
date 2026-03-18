@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # fan-stress-test.sh
-# Runs a randomized CPU stress workload and captures fan-policy telemetry.
+# Runs repeated full-core CPU bursts and captures fan-policy telemetry.
 
 set -euo pipefail
 
@@ -48,9 +48,8 @@ echo "Summary: $SUMMARY_LOG"
 } >"$RUN_LOG"
 
 while [ "$(date +%s)" -lt "$END_TIME" ]; do
-    CORES_TO_STRESS=$(((RANDOM % NUM_CORES) + 1))
-    STRESS_SEC=$(((RANDOM % 11) + 5))
-    PAUSE_SEC=$(((RANDOM % 11) + 5))
+    STRESS_SEC=$(((RANDOM % 9) + 7))
+    PAUSE_SEC=$(((RANDOM % 9) + 7))
 
     CURRENT_TIME=$(date +%s)
     REMAINING=$((END_TIME - CURRENT_TIME))
@@ -62,8 +61,8 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
         STRESS_SEC="$REMAINING"
     fi
 
-    echo "stress cores=$CORES_TO_STRESS seconds=$STRESS_SEC" | tee -a "$RUN_LOG"
-    stress-ng --cpu "$CORES_TO_STRESS" --timeout "${STRESS_SEC}s" --quiet
+    echo "stress cores=$NUM_CORES seconds=$STRESS_SEC" | tee -a "$RUN_LOG"
+    stress-ng --cpu "$NUM_CORES" --timeout "${STRESS_SEC}s" --quiet
 
     CURRENT_TIME=$(date +%s)
     REMAINING=$((END_TIME - CURRENT_TIME))
@@ -96,7 +95,6 @@ BEGIN {
     state = ""
     cpu = ""
     gpu = ""
-    ppt = ""
     for (i = 1; i <= NF; i++) {
         if ($i ~ /^state=/) {
             split($i, a, "=")
@@ -109,10 +107,6 @@ BEGIN {
             split($i, a, "=")
             sub(/C$/, "", a[2])
             gpu = a[2] + 0
-        } else if ($i ~ /^gpu_ppt=/) {
-            split($i, a, "=")
-            sub(/W$/, "", a[2])
-            ppt = a[2] + 0
         }
     }
 
@@ -128,7 +122,6 @@ BEGIN {
 
     if (cpu != "" && cpu > max_cpu) max_cpu = cpu
     if (gpu != "" && gpu > max_gpu) max_gpu = gpu
-    if (ppt != "" && ppt > max_ppt) max_ppt = ppt
 }
 END {
     print "telemetry_samples=" total_samples
@@ -141,7 +134,6 @@ END {
     print "transition_sequence=" transition_log
     print "max_cpu_c=" max_cpu + 0
     print "max_gpu_c=" max_gpu + 0
-    print "max_gpu_ppt_w=" max_ppt + 0
 }
 ' "$JOURNAL_LOG" >"$SUMMARY_LOG"
 
