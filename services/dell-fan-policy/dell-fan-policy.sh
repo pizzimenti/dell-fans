@@ -24,7 +24,6 @@ readonly HIGH_AFTER_MEDIUM_SECONDS="${HIGH_AFTER_MEDIUM_SECONDS:-5}"
 readonly SUMMARY_INTERVAL_SECONDS="${SUMMARY_INTERVAL_SECONDS:-60}"
 readonly ANY_TEMP_GUARDRAIL_C="${ANY_TEMP_GUARDRAIL_C:-80}"
 readonly LOW_ON_TEMP_C="${LOW_ON_TEMP_C:-50}"
-readonly LOW_OFF_TEMP_C="${LOW_OFF_TEMP_C:-48}"
 readonly MEDIUM_ON_TEMP_C="${MEDIUM_ON_TEMP_C:-60}"
 readonly HIGH_ON_TEMP_C="${HIGH_ON_TEMP_C:-70}"
 # Fan levels: 0=OFF  1=LOW  2=HIGH
@@ -256,22 +255,20 @@ desired_state() {
     fi
 
     # Temperature bands:
-    # - 70C and up: HIGH, but only after 5s already spent in MEDIUM
+    # - 70C and up: enter HIGH only after 5s in MEDIUM, then stay HIGH while >= 70C
     # - 60C to 69C: MEDIUM
     # - 50C to 59C: LOW
-    # - 48C and below: OFF
-    if (( hottest_temp >= HIGH_ON_TEMP_C && medium_elapsed_ms >= HIGH_AFTER_MEDIUM_SECONDS * 1000 )); then
+    # - below 50C: OFF
+    if (( current_state == 2 && hottest_temp >= HIGH_ON_TEMP_C )); then
+        printf '%s\n' "$(clamp_state 2)"
+    elif (( hottest_temp >= HIGH_ON_TEMP_C && medium_elapsed_ms >= HIGH_AFTER_MEDIUM_SECONDS * 1000 )); then
         printf '%s\n' "$(clamp_state 2)"
     elif (( hottest_temp >= MEDIUM_ON_TEMP_C )); then
         printf '3\n'
     elif (( hottest_temp >= LOW_ON_TEMP_C )); then
         printf '1\n'
-    elif (( hottest_temp <= LOW_OFF_TEMP_C )); then
-        printf '0\n'
-    elif (( current_state == 0 )); then
-        printf '0\n'
     else
-        printf '1\n'
+        printf '0\n'
     fi
 }
 

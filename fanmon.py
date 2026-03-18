@@ -57,7 +57,6 @@ def find_cooling_device(dev_type: str) -> str | None:
 # Fan levels: 0=OFF  1=LOW  2=HIGH
 # Must stay in sync with dell-fan-policy.sh
 LOW_ON_TEMP_C   = 50
-LOW_OFF_TEMP_C  = 48
 MEDIUM_ON_TEMP_C = 60
 HIGH_ON_TEMP_C   = 70
 HIGH_AFTER_MEDIUM_MS = 5_000
@@ -311,10 +310,10 @@ def build_criteria(data: dict) -> list[dict]:
     })
 
     sections.append({
-        "header": "LOW → OFF cooldown",
+        "header": "OFF band (<50C)",
         "logic": "all",
         "rows": [
-            _row(hottest <= LOW_OFF_TEMP_C, "Hottest temp", hottest, LOW_OFF_TEMP_C, "°C", cool=True),
+            _row(hottest < LOW_ON_TEMP_C, "Hottest temp", hottest, LOW_ON_TEMP_C, "°C", cool=True),
         ],
     })
 
@@ -340,7 +339,7 @@ def active_rule_indexes(data: dict, sections: list[dict]) -> list[int]:
             return [3]
         return [2]
     if level == 1:
-        if hottest <= LOW_OFF_TEMP_C:
+        if hottest < LOW_ON_TEMP_C:
             return [4]
         return [1]
     return [4]

@@ -15,7 +15,7 @@ if ! command -v journalctl &>/dev/null; then
     exit 1
 fi
 
-TOTAL_DURATION="${1:-90}"
+TOTAL_DURATION="${1:-120}"
 if [[ ! "$TOTAL_DURATION" =~ ^[0-9]+$ ]] || [ "$TOTAL_DURATION" -le 0 ]; then
     echo "Usage: $0 [duration-seconds]"
     exit 1
@@ -48,8 +48,8 @@ echo "Summary: $SUMMARY_LOG"
 } >"$RUN_LOG"
 
 while [ "$(date +%s)" -lt "$END_TIME" ]; do
-    STRESS_SEC=$(((RANDOM % 9) + 7))
-    PAUSE_SEC=$(((RANDOM % 9) + 7))
+    STRESS_SEC=$(((RANDOM % 11) + 10))
+    PAUSE_SEC=$(((RANDOM % 11) + 5))
 
     CURRENT_TIME=$(date +%s)
     REMAINING=$((END_TIME - CURRENT_TIME))
