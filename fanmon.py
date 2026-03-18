@@ -321,6 +321,31 @@ def build_criteria(data: dict) -> list[dict]:
     return sections
 
 
+def active_rule_indexes(data: dict, sections: list[dict]) -> list[int]:
+    """Return the minimal set of rule sections that explain the current state."""
+    level = data["fan_level"]
+    cpu_c = data["cpu_c"]
+    gpu_c = data["gpu_c"]
+    wifi_c = data["wifi_c"]
+    medium_elapsed_ms = data.get("medium_elapsed_ms", 0)
+    hottest = max(cpu_c, gpu_c)
+    hottest_guardrail = max(cpu_c, gpu_c, wifi_c)
+
+    if hottest_guardrail >= ANY_TEMP_GUARDRAIL_C:
+        return [0]
+    if level == 2:
+        return [3]
+    if level == 3:
+        if hottest >= HIGH_ON_TEMP_C and medium_elapsed_ms < HIGH_AFTER_MEDIUM_MS:
+            return [3]
+        return [2]
+    if level == 1:
+        if hottest <= LOW_OFF_TEMP_C:
+            return [4]
+        return [1]
+    return [4]
+
+
 # ── curses rendering ──────────────────────────────────────────────────────────
 
 COLOR_HEADER = 1
@@ -447,7 +472,7 @@ def draw(stdscr, data: dict, interval: float):
     row += 1
 
     all_sections = build_criteria(data)
-    show_idxs = [1, 2, 3, 4]
+    show_idxs = active_rule_indexes(data, all_sections)
 
     for idx in show_idxs:
         if row >= max_y - 5:
@@ -509,21 +534,6 @@ def draw(stdscr, data: dict, interval: float):
             row += 1
 
         row += 1  # blank between sections
-
-    # Emergency — single summary line
-    if row < max_y - 4:
-        emg = all_sections[0]
-        emg_rows = emg["rows"]
-        any_emg  = any(r["met"] for r in emg_rows)
-        parts_emg = []
-        for r in emg_rows:
-            v = f"{r['value']:.0f}" if r["value"] else "--"
-            t = r["threshold"]
-            parts_emg.append(f"{r['label']} {v}/{t}{r['unit']}")
-        emg_str = "  Emergency:  " + "  ·  ".join(parts_emg)
-        emg_attr = (curses.color_pair(COLOR_CRIT) | curses.A_BOLD) if any_emg else curses.color_pair(COLOR_DIM)
-        safe_addstr(stdscr, row, 0, emg_str, emg_attr)
-        row += 2
 
     # ── temperatures ──────────────────────────────────────────────────────
     if row < max_y - 3:
