@@ -1,11 +1,12 @@
 {
     "KPackageStructure": "Plasma/Applet",
     "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-UniqueApplet": true,
     "KPlugin": {
         "Authors": [
             {
                 "Email": "bradley@localhost",
-                "Name": "Bradley"
+                "Name": "Bradley Pizzimenti"
             }
         ],
         "Category": "System Information",
