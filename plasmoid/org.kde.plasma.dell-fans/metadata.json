@@ -1,0 +1,25 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "bradley@localhost",
+                "Name": "Bradley"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Shows dell-fan-policy fan state with a native Plasma popup",
+        "EnabledByDefault": true,
+        "FormFactors": [
+            "horizontal",
+            "vertical"
+        ],
+        "Icon": "temperature-normal",
+        "Id": "org.kde.plasma.dell-fans",
+        "License": "MIT",
+        "Name": "dell-fans",
+        "Version": "0.1.0",
+        "Website": "https://local"
+    }
+}

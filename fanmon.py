@@ -74,6 +74,9 @@ FAN_LEVEL_DOTS   = {
 PWM_ENABLE_NAMES = {0: "off", 1: "manual", 2: "auto (native)", 3: "auto (BIOS)"}
 
 
+_wifi_cache: dict[str, float] = {"c": 0.0}
+
+
 def ensure_root_or_reexec() -> None:
     if os.geteuid() == 0 or os.environ.get("FANMON_ELEVATED") == "1":
         return
@@ -222,7 +225,10 @@ def collect() -> dict:
         data["gpu_c"] = 0.0
 
     wifi = find_hwmon("mt7925_phy0")
-    data["wifi_c"] = _read_int(f"{wifi}/temp1_input") / 1000.0 if wifi else 0.0
+    raw_wifi_c = _read_int(f"{wifi}/temp1_input") / 1000.0 if wifi else 0.0
+    if raw_wifi_c > 0.0:
+        _wifi_cache["c"] = raw_wifi_c
+    data["wifi_c"] = _wifi_cache["c"]
 
     # ── display temps (all sensors, for the Temperatures panel) ───────────
     extra_temps = []
@@ -236,7 +242,7 @@ def collect() -> dict:
     if nvme:
         t = _read_int(f"{nvme}/temp1_input")
         extra_temps.append({"label": "NVMe", "temp_c": t / 1000.0, "source": "nvme"})
-    if wifi and data["wifi_c"]:
+    if data["wifi_c"]:
         extra_temps.append({"label": "WiFi", "temp_c": data["wifi_c"], "source": "wifi"})
     acpitz = find_hwmon("acpitz")
     if acpitz:
