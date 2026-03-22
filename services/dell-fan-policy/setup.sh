@@ -30,8 +30,20 @@ upgrade_or_install_plasmoid() {
     local plasmoid_dir="$1"
     local plugin_id="$2"
     local canonical_dir
+    local show_output
+    local installed_path
+    local canonical_installed
     canonical_dir="$(realpath "$plasmoid_dir")"
-    if run_as_user kpackagetool6 -t Plasma/Applet --show "$plugin_id" >/dev/null 2>&1; then
+    show_output="$(run_as_user kpackagetool6 -t Plasma/Applet --show "$plugin_id" 2>/dev/null || true)"
+    installed_path="$(printf '%s\n' "$show_output" | sed -n 's/^Path[[:space:]]*:[[:space:]]*//p' | head -n1)"
+    if [[ -n "$installed_path" && -e "$installed_path" ]]; then
+        canonical_installed="$(realpath "$installed_path")"
+        if [[ "$canonical_installed" == "$canonical_dir" ]]; then
+            echo "Plasma widget already installed from source path: $canonical_dir"
+            return 0
+        fi
+    fi
+    if [[ -n "$installed_path" ]]; then
         run_as_user kpackagetool6 -t Plasma/Applet --upgrade "$canonical_dir"
     else
         run_as_user kpackagetool6 -t Plasma/Applet --install "$canonical_dir"
