@@ -35,7 +35,7 @@ upgrade_or_install_plasmoid() {
     local canonical_installed
     canonical_dir="$(realpath "$plasmoid_dir")"
     show_output="$(run_as_user kpackagetool6 -t Plasma/Applet --show "$plugin_id" 2>/dev/null || true)"
-    installed_path="$(printf '%s\n' "$show_output" | sed -n 's/^Path[[:space:]]*:[[:space:]]*//p' | head -n1)"
+    installed_path="$(printf '%s\n' "$show_output" | sed -n 's/^[[:space:]]*Path[[:space:]]*:[[:space:]]*//p' | head -n1)"
     if [[ -n "$installed_path" && -e "$installed_path" ]]; then
         canonical_installed="$(realpath "$installed_path")"
         if [[ "$canonical_installed" == "$canonical_dir" ]]; then
