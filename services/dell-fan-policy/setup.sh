@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TARGET_SCRIPT="/usr/local/sbin/dell-fan-policy"
 TARGET_SERVICE="/etc/systemd/system/dell-fan-policy.service"
 TARGET_SLEEP_HOOK="/usr/lib/systemd/system-sleep/dell-fan-policy-resume"
+TARGET_LIB_DIR="/usr/local/lib/dell-fans"
 TARGET_MONITOR="/usr/local/bin/fanmonitor"
 TARGET_PLASMOID_SOURCE="/usr/local/bin/fanmon-plasmoid-source"
 
@@ -33,15 +34,19 @@ fi
 install -Dm755 "$SCRIPT_DIR/dell-fan-policy.sh" "$TARGET_SCRIPT"
 install -Dm644 "$SCRIPT_DIR/dell-fan-policy.service" "$TARGET_SERVICE"
 install -Dm755 "$SCRIPT_DIR/dell-fan-policy-resume.sh" "$TARGET_SLEEP_HOOK"
-install -Dm755 /dev/stdin "$TARGET_MONITOR" <<EOF
+install -d -m755 "$TARGET_LIB_DIR"
+install -Dm755 "$ROOT_DIR/fanmon.py"                  "$TARGET_LIB_DIR/fanmon.py"
+install -Dm755 "$ROOT_DIR/fanmon-plasmoid-source.py"  "$TARGET_LIB_DIR/fanmon-plasmoid-source.py"
+
+install -Dm755 /dev/stdin "$TARGET_MONITOR" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-exec python3 "$ROOT_DIR/fanmon.py" "\$@"
+exec python3 "/usr/local/lib/dell-fans/fanmon.py" "$@"
 EOF
-install -Dm755 /dev/stdin "$TARGET_PLASMOID_SOURCE" <<EOF
+install -Dm755 /dev/stdin "$TARGET_PLASMOID_SOURCE" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-exec python3 "$ROOT_DIR/fanmon-plasmoid-source.py" "\$@"
+exec python3 "/usr/local/lib/dell-fans/fanmon-plasmoid-source.py" "$@"
 EOF
 
 # Install/upgrade KDE Plasma widget if kpackagetool6 is available
@@ -58,6 +63,7 @@ echo "Installed:"
 echo "  $TARGET_SCRIPT"
 echo "  $TARGET_SERVICE"
 echo "  $TARGET_SLEEP_HOOK"
+echo "  $TARGET_LIB_DIR/"
 echo "  $TARGET_MONITOR"
 echo "  $TARGET_PLASMOID_SOURCE"
 echo

@@ -234,7 +234,7 @@ PlasmoidItem {
 
                         PlasmaComponents3.Label {
                             Layout.fillWidth: true
-                            text: root.data.fan_rpm.toLocaleString() + " / " + root.data.fan_max.toLocaleString() + " RPM"
+                            text: (root.data.fan_rpm ?? 0).toLocaleString() + " / " + (root.data.fan_max ?? 0).toLocaleString() + " RPM"
                             font.family: root.monospaceFamily
                         }
                     }
