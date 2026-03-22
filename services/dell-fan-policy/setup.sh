@@ -9,6 +9,7 @@ TARGET_SLEEP_HOOK="/usr/lib/systemd/system-sleep/dell-fan-policy-resume"
 TARGET_LIB_DIR="/usr/local/lib/dell-fans"
 TARGET_MONITOR="/usr/local/bin/fanmonitor"
 TARGET_PLASMOID_SOURCE="/usr/local/bin/fanmon-plasmoid-source"
+PLASMOID_PLUGIN_ID="org.kde.plasma.dell-fans"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 if [[ $EUID -ne 0 ]]; then
@@ -22,6 +23,18 @@ run_as_user() {
         sudo -u "$SUDO_USER" "$@"
     else
         "$@"
+    fi
+}
+
+upgrade_or_install_plasmoid() {
+    local plasmoid_dir="$1"
+    local plugin_id="$2"
+    local canonical_dir
+    canonical_dir="$(realpath "$plasmoid_dir")"
+    if run_as_user kpackagetool6 -t Plasma/Applet --show "$plugin_id" >/dev/null 2>&1; then
+        run_as_user kpackagetool6 -t Plasma/Applet --upgrade "$canonical_dir"
+    else
+        run_as_user kpackagetool6 -t Plasma/Applet --install "$canonical_dir"
     fi
 }
 
@@ -52,8 +65,7 @@ EOF
 # Install/upgrade KDE Plasma widget if kpackagetool6 is available
 PLASMOID_DIR="$ROOT_DIR/plasmoid/org.kde.plasma.dell-fans"
 if command -v kpackagetool6 &>/dev/null && [[ -d "$PLASMOID_DIR" ]]; then
-    run_as_user kpackagetool6 -t Plasma/Applet --upgrade "$PLASMOID_DIR" 2>/dev/null \
-        || run_as_user kpackagetool6 -t Plasma/Applet --install "$PLASMOID_DIR" 2>/dev/null \
+    upgrade_or_install_plasmoid "$PLASMOID_DIR" "$PLASMOID_PLUGIN_ID" \
         || echo "Note: Plasma widget install/upgrade skipped (may need manual add)"
 fi
 
