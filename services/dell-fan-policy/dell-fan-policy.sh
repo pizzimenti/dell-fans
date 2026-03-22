@@ -20,7 +20,8 @@ readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"             
 readonly MISMATCH_RECOVERY_POLLS="${MISMATCH_RECOVERY_POLLS:-3}"                  # consecutive mismatch polls before corrective action
 readonly MISMATCH_RECOVERY_COOLDOWN_SECONDS="${MISMATCH_RECOVERY_COOLDOWN_SECONDS:-20}"
 readonly MISMATCH_RECOVERY_SETTLE_SECONDS="${MISMATCH_RECOVERY_SETTLE_SECONDS:-1}"
-readonly MEDIUM_HIGH_SLOT_EVERY="${MEDIUM_HIGH_SLOT_EVERY:-1}"
+readonly MEDIUM_CYCLE_SLOTS="${MEDIUM_CYCLE_SLOTS:-3}"
+readonly MEDIUM_HIGH_SLOTS="${MEDIUM_HIGH_SLOTS:-1}"
 readonly HIGH_AFTER_MEDIUM_SECONDS="${HIGH_AFTER_MEDIUM_SECONDS:-5}"
 readonly SUMMARY_INTERVAL_SECONDS="${SUMMARY_INTERVAL_SECONDS:-60}"
 readonly ANY_TEMP_GUARDRAIL_C="${ANY_TEMP_GUARDRAIL_C:-80}"
@@ -399,8 +400,8 @@ commanded_hw_state() {
     case "$logical_state" in
         3)
             # The hardware exposes only OFF/LOW/HIGH, so MEDIUM is synthesized
-            # as a repeating HIGH/LOW cadence.
-            if (( medium_phase == 0 )); then
+            # as a repeating HIGH/LOW duty cycle.
+            if (( medium_phase < MEDIUM_HIGH_SLOTS )); then
                 printf '%s\n' "$(clamp_state 2)"
             else
                 printf '1\n'
@@ -506,7 +507,7 @@ main() {
             last_cmd_state="$cmd_state"
         fi
         if (( current_state == 3 )); then
-            medium_phase=$(( (medium_phase + 1) % MEDIUM_HIGH_SLOT_EVERY ))
+            medium_phase=$(( (medium_phase + 1) % MEDIUM_CYCLE_SLOTS ))
         else
             medium_phase=0
         fi

@@ -15,6 +15,7 @@ import time
 
 HWMON_BASE = "/sys/class/hwmon"
 THERMAL_BASE = "/sys/class/thermal"
+STATE_PATH = "/run/dell-fan-policy/state"
 
 def _read(path: str, default="") -> str:
     try:
@@ -92,29 +93,21 @@ def ensure_root_or_reexec() -> None:
     os.execvp("sudo", argv)
 
 
-# ── policy telemetry reader (parses last telemetry line from journal) ───────
+# ── policy state reader ──────────────────────────────────────────────────────
 
-def _read_policy_telemetry() -> dict[str, str]:
-    """Parse the last policy telemetry line from the journal into key/value pairs."""
+def _read_policy_state() -> dict[str, str]:
+    parsed: dict[str, str] = {}
     try:
-        import subprocess
-        result = subprocess.run(
-            ["journalctl", "-u", "dell-fan-policy.service", "-n", "5",
-             "--no-pager", "--output=cat"],
-            capture_output=True, text=True, timeout=1
-        )
-        for line in reversed(result.stdout.splitlines()):
-            if "telemetry " in line:
-                parsed: dict[str, str] = {}
-                for part in line.split():
-                    if "=" not in part:
-                        continue
-                    key, value = part.split("=", 1)
-                    parsed[key] = value
-                return parsed
+        with open(STATE_PATH, encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                parsed[key] = value
     except Exception:
-        pass
-    return {}
+        return {}
+    return parsed
 
 
 # ── data collection ───────────────────────────────────────────────────────────
@@ -165,21 +158,21 @@ def collect() -> dict:
         data.update(fan_rpm=0, fan_target=0, fan_max=1, fan_min=0,
                     fan_label="Fan", pwm_pct=0, pwm_mode="unknown", dell_temps=[])
 
-    telemetry = _read_policy_telemetry()
+    policy_state = _read_policy_state()
 
     # ── fan level from cooling device ──────────────────────────────────────
     cd = find_cooling_device("dell-smm-fan1")
     if cd:
         hw_level = _read_int(f"{cd}/cur_state")
-        data["fan_level"]     = int(telemetry.get("state", hw_level))
+        data["fan_level"]     = int(policy_state.get("fan_level", hw_level) or hw_level)
         data["fan_level_max"] = _read_int(f"{cd}/max_state")
         data["hw_level"]      = hw_level
     else:
         data["fan_level"]     = -1
         data["fan_level_max"] = 2
         data["hw_level"]      = -1
-    data["cmd_state"] = int(telemetry.get("cmd_state", data["hw_level"]))
-    data["medium_elapsed_ms"] = int(telemetry.get("medium_elapsed_ms", "0") or 0)
+    data["cmd_state"] = int(policy_state.get("cmd_state", data["hw_level"]) or data["hw_level"])
+    data["medium_elapsed_ms"] = int(policy_state.get("medium_elapsed_ms", "0") or 0)
 
     # ── discrepancy detection ───────────────────────────────────────────────
     discrepancies = []
