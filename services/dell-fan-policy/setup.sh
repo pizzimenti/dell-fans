@@ -82,6 +82,8 @@ if command -v kpackagetool6 &>/dev/null && [[ -d "$PLASMOID_DIR" ]]; then
 fi
 
 systemctl daemon-reload
+systemctl enable dell-fan-policy.service
+systemctl restart dell-fan-policy.service
 
 echo "Installed:"
 echo "  $TARGET_SCRIPT"
@@ -91,6 +93,8 @@ echo "  $TARGET_LIB_DIR/"
 echo "  $TARGET_MONITOR"
 echo "  $TARGET_PLASMOID_SOURCE"
 echo
-echo "Next steps:"
-echo "  systemctl enable --now dell-fan-policy.service"
+echo "Service status:"
+systemctl --no-pager --full status dell-fan-policy.service || true
+echo
+echo "View logs:"
 echo "  journalctl -u dell-fan-policy.service -f"
