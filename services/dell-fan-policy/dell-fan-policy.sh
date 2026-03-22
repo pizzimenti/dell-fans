@@ -20,6 +20,7 @@ readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"             
 readonly MISMATCH_RECOVERY_POLLS="${MISMATCH_RECOVERY_POLLS:-3}"                  # consecutive mismatch polls before corrective action
 readonly MISMATCH_RECOVERY_COOLDOWN_SECONDS="${MISMATCH_RECOVERY_COOLDOWN_SECONDS:-20}"
 readonly MISMATCH_RECOVERY_SETTLE_SECONDS="${MISMATCH_RECOVERY_SETTLE_SECONDS:-1}"
+readonly MISMATCH_RECOVERY_MAX_COOLDOWN_SECONDS="${MISMATCH_RECOVERY_MAX_COOLDOWN_SECONDS:-300}"
 readonly MEDIUM_CYCLE_SLOTS="${MEDIUM_CYCLE_SLOTS:-3}"
 readonly MEDIUM_HIGH_SLOTS="${MEDIUM_HIGH_SLOTS:-1}"
 readonly HIGH_AFTER_MEDIUM_SECONDS="${HIGH_AFTER_MEDIUM_SECONDS:-5}"
@@ -199,6 +200,11 @@ recover_fan_state_mismatch() {
         sleep "$MISMATCH_RECOVERY_SETTLE_SECONDS"
     fi
     set_fan_state "$desired_state"
+}
+
+handle_signal_exit() {
+    restore_bios_auto
+    exit 0
 }
 
 read_sensor_value_millideg() {
@@ -415,7 +421,8 @@ commanded_hw_state() {
 
 main() {
     discover_control_path
-    trap 'restore_bios_auto' EXIT INT TERM HUP
+    trap 'restore_bios_auto' EXIT
+    trap 'handle_signal_exit' INT TERM HUP
     enable_manual_mode
 
     local cpu_raw gpu_raw wifi_raw cpu_c gpu_c wifi_c
@@ -519,6 +526,10 @@ main() {
                 last_recovery_epoch="$now"
                 mismatch_polls=0
                 recovery_events=$(( recovery_events + 1 ))
+                mismatch_recovery_cooldown_ms=$(( mismatch_recovery_cooldown_ms * 2 ))
+                if (( mismatch_recovery_cooldown_ms > MISMATCH_RECOVERY_MAX_COOLDOWN_SECONDS * 1000 )); then
+                    mismatch_recovery_cooldown_ms=$(( MISMATCH_RECOVERY_MAX_COOLDOWN_SECONDS * 1000 ))
+                fi
                 fan_rpm="$(read_fan_rpm)"
                 fan_target="$(read_fan_target)"
                 pwm_value="$(read_pwm_value)"
@@ -527,6 +538,8 @@ main() {
                     low_fan_mismatch=1
                 fi
             fi
+        else
+            mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
         fi
 
         policy_rule="$(policy_rule_label "$current_state" "$cpu_c" "$gpu_c" "$wifi_c" "$medium_elapsed_ms")"
