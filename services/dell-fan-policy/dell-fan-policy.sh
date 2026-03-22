@@ -13,7 +13,8 @@ set -euo pipefail
 # - HIGH requires 5 seconds already spent in MEDIUM unless the 80C guardrail trips.
 # - No AC/battery logic, profile logic, trend detection, or power-based escalation.
 
-readonly POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
+readonly POLL_FAST_SECONDS="${POLL_FAST_SECONDS:-1}"
+readonly POLL_SLOW_SECONDS="${POLL_SLOW_SECONDS:-3}"
 readonly LOW_SETTLED_RPM_MARGIN="${LOW_SETTLED_RPM_MARGIN:-500}"                  # LOW timers start only after RPM is near target
 readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"               # LOW mismatch if RPM stays this far above target
 readonly MISMATCH_RECOVERY_POLLS="${MISMATCH_RECOVERY_POLLS:-3}"                  # consecutive mismatch polls before corrective action
@@ -31,6 +32,8 @@ readonly HIGH_ON_TEMP_C="${HIGH_ON_TEMP_C:-70}"
 readonly CPU_SENSOR_LABEL="${CPU_SENSOR_LABEL:-Tctl}"
 readonly GPU_SENSOR_LABEL="${GPU_SENSOR_LABEL:-edge}"
 readonly WIFI_SENSOR_GLOB="${WIFI_SENSOR_GLOB:-mt*_phy*-pci-*}"
+readonly STATE_DIR="${STATE_DIR:-/run/dell-fan-policy}"
+readonly STATE_PATH="${STATE_PATH:-$STATE_DIR/state}"
 
 hwmon_dir=""
 control_file=""
@@ -46,6 +49,39 @@ now_ms() {
 seconds_to_ms() {
     local seconds="$1"
     printf '%s\n' $(( seconds * 1000 ))
+}
+
+write_runtime_state() {
+    local cpu_c="$1"
+    local gpu_c="$2"
+    local wifi_c="$3"
+    local fan_level="$4"
+    local fan_rpm="$5"
+    local pwm_pct="$6"
+    local policy_rule="$7"
+    local medium_elapsed_ms="$8"
+    local cmd_state="$9"
+    local hw_state="${10}"
+    local path="${11:-$STATE_PATH}"
+    local tmp
+
+    mkdir -p "$STATE_DIR"
+    tmp="${path}.tmp"
+    {
+        printf 'timestamp=%s\n' "$(date +%s)"
+        printf 'cpu_c=%s\n' "$cpu_c"
+        printf 'gpu_c=%s\n' "$gpu_c"
+        printf 'wifi_c=%s\n' "$wifi_c"
+        printf 'fan_level=%s\n' "$fan_level"
+        printf 'fan_rpm=%s\n' "$fan_rpm"
+        printf 'pwm_pct=%s\n' "$pwm_pct"
+        printf 'policy_rule=%s\n' "$policy_rule"
+        printf 'medium_elapsed_ms=%s\n' "$medium_elapsed_ms"
+        printf 'cmd_state=%s\n' "$cmd_state"
+        printf 'hw_level=%s\n' "$hw_state"
+    } >"$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$path"
 }
 
 read_first_line() {
@@ -272,6 +308,91 @@ desired_state() {
     fi
 }
 
+policy_rule_label() {
+    local logical_state="$1"
+    local cpu_c="$2"
+    local gpu_c="$3"
+    local wifi_c="$4"
+    local medium_elapsed_ms="${5:-0}"
+    local hottest_temp="$cpu_c"
+    local hottest_guardrail_temp="$cpu_c"
+
+    if (( gpu_c > hottest_temp )); then
+        hottest_temp="$gpu_c"
+    fi
+    hottest_guardrail_temp="$hottest_temp"
+    if (( wifi_c > hottest_guardrail_temp )); then
+        hottest_guardrail_temp="$wifi_c"
+    fi
+
+    if (( hottest_guardrail_temp >= ANY_TEMP_GUARDRAIL_C )); then
+        printf 'guardrail_high\n'
+    elif (( logical_state == 2 )); then
+        printf 'high_band\n'
+    elif (( logical_state == 3 && hottest_temp >= HIGH_ON_TEMP_C && medium_elapsed_ms < HIGH_AFTER_MEDIUM_SECONDS * 1000 )); then
+        printf 'high_wait_in_medium\n'
+    elif (( logical_state == 3 )); then
+        printf 'medium_band\n'
+    elif (( logical_state == 1 )); then
+        printf 'low_band\n'
+    else
+        printf 'off_band\n'
+    fi
+}
+
+temp_threshold_bucket() {
+    local temp="$1"
+    if (( temp >= ANY_TEMP_GUARDRAIL_C )); then
+        printf '80+\n'
+    elif (( temp >= HIGH_ON_TEMP_C )); then
+        printf '70-79\n'
+    elif (( temp >= MEDIUM_ON_TEMP_C )); then
+        printf '60-69\n'
+    elif (( temp >= LOW_ON_TEMP_C )); then
+        printf '50-59\n'
+    else
+        printf '<50\n'
+    fi
+}
+
+requires_fast_poll() {
+    local cpu_c="$1"
+    local gpu_c="$2"
+    local wifi_c="$3"
+    local temp
+
+    for temp in "$cpu_c" "$gpu_c" "$wifi_c"; do
+        if (( temp >= ANY_TEMP_GUARDRAIL_C - 3 )); then
+            return 0
+        fi
+        if (( temp >= LOW_ON_TEMP_C - 3 && temp <= LOW_ON_TEMP_C + 3 )); then
+            return 0
+        fi
+        if (( temp >= MEDIUM_ON_TEMP_C - 3 && temp <= MEDIUM_ON_TEMP_C + 3 )); then
+            return 0
+        fi
+        if (( temp >= HIGH_ON_TEMP_C - 3 && temp <= HIGH_ON_TEMP_C + 3 )); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+highest_guardrail_temp() {
+    local cpu_c="$1"
+    local gpu_c="$2"
+    local wifi_c="$3"
+    local hottest="$cpu_c"
+
+    if (( gpu_c > hottest )); then
+        hottest="$gpu_c"
+    fi
+    if (( wifi_c > hottest )); then
+        hottest="$wifi_c"
+    fi
+    printf '%s\n' "$hottest"
+}
+
 commanded_hw_state() {
     local logical_state="$1"
     local medium_phase="$2"
@@ -300,9 +421,11 @@ main() {
     local fan_rpm fan_target pwm_value hw_fan_state cmd_state last_cmd_state=-1 low_fan_mismatch=0
     local mismatch_polls=0 last_recovery_epoch=0 medium_phase=0
     local current_state next_state now medium_entered_epoch=0 medium_elapsed_ms=0
-    local mismatch_recovery_cooldown_ms summary_interval_ms
+    local mismatch_recovery_cooldown_ms summary_interval_ms poll_sleep_seconds
     local last_summary_epoch=0 summary_samples=0 recovery_events=0 mismatch_events=0
     local sum_cpu=0 sum_gpu=0 sum_rpm=0 state0_samples=0 state1_samples=0 state2_samples=0 state3_samples=0
+    local policy_rule threshold_bucket prev_threshold_bucket="" telemetry_due=0 trigger_temp
+    local last_telemetry_epoch=0 prev_logged_state=-1 prev_logged_cmd_state=-1 prev_policy_rule=""
 
     mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
     summary_interval_ms="$(seconds_to_ms "$SUMMARY_INTERVAL_SECONDS")"
@@ -315,7 +438,7 @@ main() {
             log "WARNING: CPU sensor unavailable; forcing max fan state"
             current_state="$(clamp_state "$max_state")"
             set_fan_state "$current_state"
-            sleep "$POLL_INTERVAL_SECONDS"
+            sleep "$POLL_FAST_SECONDS"
             continue
         fi
 
@@ -323,7 +446,7 @@ main() {
             log "WARNING: GPU sensor unavailable; forcing max fan state"
             current_state="$(clamp_state "$max_state")"
             set_fan_state "$current_state"
-            sleep "$POLL_INTERVAL_SECONDS"
+            sleep "$POLL_FAST_SECONDS"
             continue
         fi
 
@@ -405,11 +528,43 @@ main() {
             fi
         fi
 
-        log "telemetry cpu=${cpu_c}C gpu=${gpu_c}C wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} medium_elapsed_ms=${medium_elapsed_ms} low_mismatch=${low_fan_mismatch} mismatch_polls=${mismatch_polls}"
+        policy_rule="$(policy_rule_label "$current_state" "$cpu_c" "$gpu_c" "$wifi_c" "$medium_elapsed_ms")"
+        trigger_temp="$(highest_guardrail_temp "$cpu_c" "$gpu_c" "$wifi_c")"
+        threshold_bucket="$(temp_threshold_bucket "$trigger_temp")"
+        if (( last_telemetry_epoch == 0 || now - last_telemetry_epoch >= summary_interval_ms )); then
+            telemetry_due=1
+        else
+            telemetry_due=0
+        fi
+        if [[ "$threshold_bucket" != "$prev_threshold_bucket" ]]; then
+            telemetry_due=1
+            prev_threshold_bucket="$threshold_bucket"
+        fi
+        if (( current_state != prev_logged_state || cmd_state != prev_logged_cmd_state )) || [[ "$policy_rule" != "$prev_policy_rule" ]]; then
+            telemetry_due=1
+        fi
+        if (( telemetry_due )); then
+            log "telemetry cpu=${cpu_c}C gpu=${gpu_c}C wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} medium_elapsed_ms=${medium_elapsed_ms} low_mismatch=${low_fan_mismatch} mismatch_polls=${mismatch_polls} policy_rule=${policy_rule} threshold_bucket=${threshold_bucket}"
+            last_telemetry_epoch="$now"
+            prev_logged_state="$current_state"
+            prev_logged_cmd_state="$cmd_state"
+            prev_policy_rule="$policy_rule"
+        fi
         if (( low_fan_mismatch )); then
             log "WARNING: LOW mismatch hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value}"
             mismatch_events=$(( mismatch_events + 1 ))
         fi
+        write_runtime_state \
+            "$cpu_c" \
+            "$gpu_c" \
+            "$wifi_c" \
+            "$current_state" \
+            "$fan_rpm" \
+            "$(( pwm_value * 100 / 255 ))" \
+            "$policy_rule" \
+            "$medium_elapsed_ms" \
+            "$cmd_state" \
+            "$hw_fan_state"
         summary_samples=$(( summary_samples + 1 ))
         sum_cpu=$(( sum_cpu + cpu_c ))
         sum_gpu=$(( sum_gpu + gpu_c ))
@@ -438,7 +593,12 @@ main() {
             mismatch_events=0
             recovery_events=0
         fi
-        sleep "$POLL_INTERVAL_SECONDS"
+        if requires_fast_poll "$cpu_c" "$gpu_c" "$wifi_c"; then
+            poll_sleep_seconds="$POLL_FAST_SECONDS"
+        else
+            poll_sleep_seconds="$POLL_SLOW_SECONDS"
+        fi
+        sleep "$poll_sleep_seconds"
     done
 }
 

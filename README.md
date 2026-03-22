@@ -45,6 +45,8 @@ The daemon (`dell-fan-policy.sh`) drives a stepped fan policy from CPU and GPU t
 - **MED** is a synthetic state — the hardware only supports LOW and HIGH. MED duty-cycles between them.
 - HIGH requires 5 seconds already in MED (prevents fan thrashing on brief spikes).
 - Wi-Fi temperature acts as a guardrail only — it can force HIGH at 80 C+ but doesn't drive normal transitions.
+- Polling runs at 1s near band boundaries and guardrail temperatures, otherwise 3s.
+- Runtime state is written to `/run/dell-fan-policy/state` for consumers.
 - BIOS auto mode is restored on daemon exit.
 - The daemon restarts automatically after suspend/resume.
 
@@ -92,7 +94,8 @@ Runs randomized CPU bursts via `stress-ng` and captures fan policy telemetry fro
 - `/sys/class/hwmon/` — `dell_smm`, `k10temp`, `amdgpu`, `nvme`, `mt7925_phy0`
 - `/sys/class/thermal/cooling_device*` — `dell-smm-fan1` fan level state
 - `/sys/firmware/acpi/platform_profile` — active power profile
-- `journalctl -u dell-fan-policy.service` — policy telemetry
+- `/run/dell-fan-policy/state` — daemon runtime state for the plasmoid
+- `journalctl -u dell-fan-policy.service` — transition and summary telemetry
 
 ## License
 

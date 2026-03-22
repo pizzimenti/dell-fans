@@ -13,8 +13,7 @@ import org.kde.plasma.plasmoid
 PlasmoidItem {
     id: root
 
-    property string liveScript: "fanmon-plasmoid-source"
-    property string currentCommand: ""
+    readonly property string currentCommand: "fanmon-plasmoid-source"
     property int refreshMs: 2000
     property string monospaceFamily: "monospace"
 
@@ -23,6 +22,7 @@ PlasmoidItem {
         fan_rpm: 0, fan_target: 0, fan_max: 5000, fan_min: 0,
         pwm_pct: 0, pwm_enable: 0, pwm_raw: 0, pwm_mode: "unknown",
         fan_level: -1, fan_level_max: 2, hw_level: -1, cmd_state: -1,
+        policy_rule: "",
         medium_elapsed_ms: 0,
         cpu_c: 0.0, gpu_c: 0.0, wifi_c: 0.0,
         temp_count: 0,
@@ -79,33 +79,26 @@ PlasmoidItem {
     }
 
     function activeRuleLabel() {
-        const level  = data.fan_level;
-        const hottest = hottestC;
-        const guard   = hottestGuardrailC;
-        const medMs   = data.medium_elapsed_ms || 0;
-        if (guard  >= 80) return "Guardrail → HIGH (≥ 80°C)";
-        if (level  === 2) return "HIGH band (70°C+, held for 5s in MED)";
-        if (level  === 3) {
-            if (hottest >= 70 && medMs < 5000) {
-                return "HIGH band (waiting " + ((5000 - medMs) / 1000).toFixed(1) + "s more in MED)";
-            }
+        const medMs = data.medium_elapsed_ms || 0;
+        switch (data.policy_rule) {
+        case "guardrail_high":
+            return "Guardrail → HIGH (≥ 80°C)";
+        case "high_band":
+            return "HIGH band (70°C+, held for 5s in MED)";
+        case "high_wait_in_medium":
+            return "HIGH band (waiting " + ((5000 - medMs) / 1000).toFixed(1) + "s more in MED)";
+        case "medium_band":
             return "MEDIUM band (60°C–69°C)";
+        case "low_band":
+            return "LOW band (50°C–59°C)";
+        case "off_band":
+            return "OFF band (<50°C)";
         }
-        if (level  === 1) return "LOW band (50°C–59°C)";
-        if (level  === 0) return "OFF band (<50°C)";
         return "No policy data";
     }
 
-    function shellEscape(value) {
-        return value.replace(/'/g, "'\\''");
-    }
-
     function pollNow() {
-        const next = "bash -lc '" + shellEscape(liveScript) + "; echo __poll=" + Date.now() + "'";
-        if (currentCommand) {
-            executableSource.disconnectSource(currentCommand);
-        }
-        currentCommand = next;
+        executableSource.disconnectSource(currentCommand);
         executableSource.connectSource(currentCommand);
     }
 
@@ -115,6 +108,7 @@ PlasmoidItem {
             fan_rpm: 0, fan_target: 0, fan_max: 5000, fan_min: 0,
             pwm_pct: 0, pwm_enable: 0, pwm_raw: 0, pwm_mode: "unknown",
             fan_level: -1, fan_level_max: 2, hw_level: -1, cmd_state: -1,
+            policy_rule: "",
             medium_elapsed_ms: 0,
             cpu_c: 0.0, gpu_c: 0.0, wifi_c: 0.0,
             temp_count: 0,
@@ -143,6 +137,8 @@ PlasmoidItem {
                 next[key] = parseFloat(value) || 0.0;
             } else if (key === "pwm_mode") {
                 next.pwm_mode = value;
+            } else if (key === "policy_rule") {
+                next.policy_rule = value;
             } else {
                 const tempLabel = key.match(/^temp_(\d+)_label$/);
                 if (tempLabel) {
@@ -417,7 +413,7 @@ PlasmoidItem {
 
     Timer {
         id: pollTimer
-        interval: root.refreshMs
+        interval: root.expanded ? root.refreshMs : 10000
         repeat: true
         running: true
         triggeredOnStart: true
@@ -427,7 +423,7 @@ PlasmoidItem {
     onExpandedChanged: function() {
         if (root.expanded) {
             root.pollNow();
-        } else if (root.currentCommand) {
+        } else {
             executableSource.disconnectSource(root.currentCommand);
         }
     }

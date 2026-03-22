@@ -3,16 +3,18 @@
 fanmon-plasmoid-source.py — Outputs current fan/temp state as key=value lines.
 
 Called by the org.kde.plasma.dell-fans plasmoid on each poll cycle.
-Reads directly from sysfs (world-readable) and journalctl; no root needed.
+Reads directly from sysfs (world-readable) and the daemon state file; no root needed.
 """
 
 import os
-import subprocess
 import time
 
 HWMON_BASE = "/sys/class/hwmon"
 THERMAL_BASE = "/sys/class/thermal"
+STATE_PATH = "/run/dell-fan-policy/state"
 PWM_ENABLE_NAMES = {0: "off", 1: "manual", 2: "auto (native)", 3: "auto (BIOS)"}
+_HWMON_CACHE = {}
+_COOLING_CACHE = {}
 
 
 def _read(path, default=""):
@@ -32,48 +34,57 @@ def _read_int(path, default=0):
 
 
 def find_hwmon(name):
+    cached = _HWMON_CACHE.get(name)
+    if cached and os.path.isdir(cached):
+        return cached
     try:
         for entry in sorted(os.listdir(HWMON_BASE)):
             path = os.path.join(HWMON_BASE, entry)
             if _read(os.path.join(path, "name")) == name:
+                _HWMON_CACHE[name] = path
                 return path
     except Exception:
         pass
+    _HWMON_CACHE.pop(name, None)
     return None
 
 
 def find_cooling_device(dev_type):
+    cached = _COOLING_CACHE.get(dev_type)
+    if cached and os.path.isdir(cached):
+        return cached
     try:
         for entry in sorted(os.listdir(THERMAL_BASE)):
             if not entry.startswith("cooling_device"):
                 continue
             path = os.path.join(THERMAL_BASE, entry)
             if _read(os.path.join(path, "type")) == dev_type:
+                _COOLING_CACHE[dev_type] = path
                 return path
     except Exception:
         pass
+    _COOLING_CACHE.pop(dev_type, None)
     return None
 
 
-def read_policy_telemetry():
+def invalidate_caches():
+    _HWMON_CACHE.clear()
+    _COOLING_CACHE.clear()
+
+
+def read_policy_state():
+    parsed = {}
     try:
-        result = subprocess.run(
-            ["journalctl", "-u", "dell-fan-policy.service", "-n", "5",
-             "--no-pager", "--output=cat"],
-            capture_output=True, text=True, timeout=1,
-        )
-        for line in reversed(result.stdout.splitlines()):
-            if "telemetry " in line:
-                parsed = {}
-                for part in line.split():
-                    if "=" not in part:
-                        continue
-                    key, value = part.split("=", 1)
-                    parsed[key] = value
-                return parsed
+        with open(STATE_PATH, encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                parsed[key] = value
     except Exception:
-        pass
-    return {}
+        return {}
+    return parsed
 
 
 def collect():
@@ -124,31 +135,45 @@ def collect():
         dell_temps = []
 
     # ── policy telemetry ──────────────────────────────────────────────────
-    telemetry = read_policy_telemetry()
+    policy_state = read_policy_state()
 
     cd = find_cooling_device("dell-smm-fan1")
     if cd:
         hw_level      = _read_int(f"{cd}/cur_state")
         fan_level_max = _read_int(f"{cd}/max_state")
+        if hw_level < 0:
+            _COOLING_CACHE.pop("dell-smm-fan1", None)
     else:
         hw_level      = -1
         fan_level_max = 2
 
-    fan_level        = int(telemetry.get("state",              hw_level))
-    cmd_state        = int(telemetry.get("cmd_state",          hw_level))
-    medium_elapsed_ms = int(telemetry.get("medium_elapsed_ms", "0") or 0)
+    fan_level        = int(policy_state.get("fan_level",       hw_level) or hw_level)
+    cmd_state        = int(policy_state.get("cmd_state",       hw_level) or hw_level)
+    medium_elapsed_ms = int(policy_state.get("medium_elapsed_ms", "0") or 0)
+    policy_rule      = policy_state.get("policy_rule", "")
     lines += [
         f"fan_level={fan_level}",
         f"fan_level_max={fan_level_max}",
         f"hw_level={hw_level}",
         f"cmd_state={cmd_state}",
         f"medium_elapsed_ms={medium_elapsed_ms}",
+        f"policy_rule={policy_rule}",
     ]
 
     # ── policy sensor inputs ──────────────────────────────────────────────
     k10    = find_hwmon("k10temp")
     amdgpu = find_hwmon("amdgpu")
     wifi   = find_hwmon("mt7925_phy0")
+
+    if k10 and not os.path.exists(f"{k10}/temp1_input"):
+        _HWMON_CACHE.pop("k10temp", None)
+        k10 = find_hwmon("k10temp")
+    if amdgpu and not os.path.exists(f"{amdgpu}/temp1_input"):
+        _HWMON_CACHE.pop("amdgpu", None)
+        amdgpu = find_hwmon("amdgpu")
+    if wifi and not os.path.exists(f"{wifi}/temp1_input"):
+        _HWMON_CACHE.pop("mt7925_phy0", None)
+        wifi = find_hwmon("mt7925_phy0")
 
     cpu_c  = _read_int(f"{k10}/temp1_input")    / 1000.0 if k10    else 0.0
     gpu_c  = _read_int(f"{amdgpu}/temp1_input") / 1000.0 if amdgpu else 0.0
