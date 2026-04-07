@@ -413,7 +413,7 @@ PlasmoidItem {
 
     Timer {
         id: pollTimer
-        interval: root.expanded ? root.refreshMs : 10000
+        interval: root.expanded ? root.refreshMs : 30000
         repeat: true
         running: true
         triggeredOnStart: true

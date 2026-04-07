@@ -30,20 +30,18 @@ upgrade_or_install_plasmoid() {
     local plasmoid_dir="$1"
     local plugin_id="$2"
     local canonical_dir
-    local show_output
-    local installed_path
-    local canonical_installed
+    local user_plasmoid_dir="$HOME/.local/share/plasma/plasmoids/$plugin_id"
     canonical_dir="$(realpath "$plasmoid_dir")"
-    show_output="$(run_as_user kpackagetool6 -t Plasma/Applet --show "$plugin_id" 2>/dev/null || true)"
-    installed_path="$(printf '%s\n' "$show_output" | sed -n 's/^[[:space:]]*Path[[:space:]]*:[[:space:]]*//p' | head -n1)"
-    if [[ -n "$installed_path" && -e "$installed_path" ]]; then
-        canonical_installed="$(realpath "$installed_path")"
-        if [[ "$canonical_installed" == "$canonical_dir" ]]; then
-            echo "Plasma widget already installed from source path: $canonical_dir"
-            return 0
-        fi
+
+    # If a dev symlink (e.g. ~/.local/share/plasma/plasmoids/<id> -> source repo)
+    # exists, remove the symlink itself before invoking kpackagetool6. Otherwise
+    # `kpackagetool6 --upgrade` follows the symlink and rm -rf's the source repo.
+    if [[ -L "$user_plasmoid_dir" ]]; then
+        echo "Removing dev symlink $user_plasmoid_dir -> $(readlink "$user_plasmoid_dir")"
+        run_as_user rm -f -- "$user_plasmoid_dir"
     fi
-    if [[ -n "$installed_path" ]]; then
+
+    if [[ -d "$user_plasmoid_dir" ]]; then
         run_as_user kpackagetool6 -t Plasma/Applet --upgrade "$canonical_dir"
     else
         run_as_user kpackagetool6 -t Plasma/Applet --install "$canonical_dir"
