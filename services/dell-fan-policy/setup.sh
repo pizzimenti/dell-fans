@@ -33,12 +33,23 @@ upgrade_or_install_plasmoid() {
     local user_plasmoid_dir="$HOME/.local/share/plasma/plasmoids/$plugin_id"
     canonical_dir="$(realpath "$plasmoid_dir")"
 
-    # If a dev symlink (e.g. ~/.local/share/plasma/plasmoids/<id> -> source repo)
-    # exists, remove the symlink itself before invoking kpackagetool6. Otherwise
-    # `kpackagetool6 --upgrade` follows the symlink and rm -rf's the source repo.
+    # If a dev symlink at ~/.local/share/plasma/plasmoids/<id> points back at
+    # *this* checkout, remove the symlink itself before invoking kpackagetool6.
+    # Otherwise `kpackagetool6 --upgrade` follows the symlink and rm -rf's the
+    # source repo. We only touch links pointing at this checkout — an unrelated
+    # symlinked install (e.g. another working tree) is left alone and we bail
+    # out so the user can resolve it manually.
     if [[ -L "$user_plasmoid_dir" ]]; then
-        echo "Removing dev symlink $user_plasmoid_dir -> $(readlink "$user_plasmoid_dir")"
-        run_as_user rm -f -- "$user_plasmoid_dir"
+        local installed_target
+        installed_target="$(realpath "$user_plasmoid_dir")"
+        if [[ "$installed_target" == "$canonical_dir" ]]; then
+            echo "Removing dev symlink $user_plasmoid_dir -> $(readlink "$user_plasmoid_dir")"
+            run_as_user rm -f -- "$user_plasmoid_dir"
+        else
+            echo "Refusing to remove unrelated symlink $user_plasmoid_dir -> $(readlink "$user_plasmoid_dir")" >&2
+            echo "Resolved target ($installed_target) does not match this checkout ($canonical_dir)." >&2
+            return 1
+        fi
     fi
 
     if [[ -d "$user_plasmoid_dir" ]]; then
