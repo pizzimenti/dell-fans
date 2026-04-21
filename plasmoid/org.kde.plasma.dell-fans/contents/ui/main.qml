@@ -2,7 +2,6 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Layouts
-
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.extras as PlasmaExtras
@@ -13,8 +12,15 @@ import org.kde.plasma.plasmoid
 PlasmoidItem {
     id: root
 
-    readonly property string currentCommand: "fanmon-plasmoid-source"
-    property int refreshMs: 2000
+    readonly property string fullCommand: "fanmon-plasmoid-source"
+    readonly property string compactCommand: "fanmon-plasmoid-source --compact"
+    readonly property string currentCommand: root.expanded ? fullCommand : compactCommand
+    property int refreshMs: 1000
+    property int collapsedRefreshMs: 5000
+    // Flip to true to emit a "[fanmon]" diagnostic stream to the journal:
+    //   journalctl --user -f -o cat | grep fanmon
+    property bool diagnosticsEnabled: false
+    property double lastPollStartedMs: 0
     property string monospaceFamily: "monospace"
 
     property var data: ({
@@ -97,73 +103,101 @@ PlasmoidItem {
         return "No policy data";
     }
 
+    function log(...args) {
+        if (!root.diagnosticsEnabled) return;
+        console.log("[fanmon]", ...args);
+    }
+
     function pollNow() {
-        executableSource.disconnectSource(currentCommand);
+        // Drop any in-flight source so the next connectSource runs fresh at
+        // the new cadence/mode (e.g. on an expanded→collapsed transition).
+        executableSource.disconnectSource(fullCommand);
+        executableSource.disconnectSource(compactCommand);
+        root.lastPollStartedMs = Date.now();
+        root.log("pollNow expanded=" + root.expanded
+            + " cmd=" + currentCommand
+            + " intervalMs=" + pollTimer.interval);
         executableSource.connectSource(currentCommand);
     }
 
+    // Lifted out of parseState so we don't rebuild Sets or recompile regexes
+    // on every poll. parseState runs 1 Hz while expanded; keeping these at
+    // component scope drops the hot-loop allocation.
+    readonly property var _intKeys: new Set([
+        "timestamp", "fan_rpm", "fan_target", "fan_max", "fan_min",
+        "pwm_pct", "pwm_enable", "pwm_raw",
+        "fan_level", "fan_level_max", "hw_level", "cmd_state",
+        "medium_elapsed_ms", "temp_count", "discrepancy_count"
+    ])
+    readonly property var _floatKeys: new Set(["cpu_c", "gpu_c", "wifi_c"])
+    readonly property var _tempLabelRe: /^temp_(\d+)_label$/
+    readonly property var _tempCRe: /^temp_(\d+)_c$/
+    readonly property var _tempOkRe: /^temp_(\d+)_ok$/
+    readonly property var _discrepancyRe: /^discrepancy_\d+$/
+    readonly property var _newlineRe: /\r?\n/
+
     function parseState(rawText) {
-        const next = {
-            timestamp: 0,
-            fan_rpm: 0, fan_target: 0, fan_max: 5000, fan_min: 0,
-            pwm_pct: 0, pwm_enable: 0, pwm_raw: 0, pwm_mode: "unknown",
-            fan_level: -1, fan_level_max: 2, hw_level: -1, cmd_state: -1,
-            policy_rule: "",
-            medium_elapsed_ms: 0,
-            cpu_c: 0.0, gpu_c: 0.0, wifi_c: 0.0,
-            temp_count: 0,
-            discrepancy_count: 0
-        };
+        // Merge semantics: start from the existing data so fields not present
+        // in the current output (e.g. compact polls that only emit a handful
+        // of keys) keep their last-known value from the previous full poll.
+        const next = Object.assign({}, data);
         const nextTemps = [];
         const nextDiscrepancies = [];
+        let mode = "full";
 
-        const intKeys = new Set([
-            "timestamp", "fan_rpm", "fan_target", "fan_max", "fan_min",
-            "pwm_pct", "pwm_enable", "pwm_raw",
-            "fan_level", "fan_level_max", "hw_level", "cmd_state",
-            "medium_elapsed_ms", "temp_count", "discrepancy_count"
-        ]);
-        const floatKeys = new Set(["cpu_c", "gpu_c", "wifi_c"]);
-
-        for (const line of (rawText || "").split(/\r?\n/)) {
+        for (const line of (rawText || "").split(_newlineRe)) {
             if (!line || !line.includes("=")) continue;
             const idx = line.indexOf("=");
             const key = line.slice(0, idx);
             const value = line.slice(idx + 1);
 
-            if (intKeys.has(key)) {
+            if (key === "mode") {
+                mode = value;
+            } else if (_intKeys.has(key)) {
                 next[key] = parseInt(value, 10) || 0;
-            } else if (floatKeys.has(key)) {
+            } else if (_floatKeys.has(key)) {
                 next[key] = parseFloat(value) || 0.0;
             } else if (key === "pwm_mode") {
                 next.pwm_mode = value;
             } else if (key === "policy_rule") {
                 next.policy_rule = value;
             } else {
-                const tempLabel = key.match(/^temp_(\d+)_label$/);
-                if (tempLabel) {
-                    const i = parseInt(tempLabel[1], 10);
-                    if (!nextTemps[i]) nextTemps[i] = { label: "", c: 0 };
+                let m;
+                if ((m = _tempLabelRe.exec(key))) {
+                    const i = parseInt(m[1], 10);
+                    if (!nextTemps[i]) nextTemps[i] = { label: "", c: 0, ok: true };
                     nextTemps[i].label = value;
-                    continue;
-                }
-                const tempC = key.match(/^temp_(\d+)_c$/);
-                if (tempC) {
-                    const i = parseInt(tempC[1], 10);
-                    if (!nextTemps[i]) nextTemps[i] = { label: "", c: 0 };
+                } else if ((m = _tempCRe.exec(key))) {
+                    const i = parseInt(m[1], 10);
+                    if (!nextTemps[i]) nextTemps[i] = { label: "", c: 0, ok: true };
                     nextTemps[i].c = parseFloat(value) || 0.0;
-                    continue;
-                }
-                const disc = key.match(/^discrepancy_\d+$/);
-                if (disc) {
+                } else if ((m = _tempOkRe.exec(key))) {
+                    const i = parseInt(m[1], 10);
+                    if (!nextTemps[i]) nextTemps[i] = { label: "", c: 0, ok: true };
+                    nextTemps[i].ok = parseInt(value, 10) !== 0;
+                } else if (_discrepancyRe.test(key)) {
                     nextDiscrepancies.push(value);
                 }
             }
         }
 
         data = next;
-        temps = nextTemps.filter(t => t && t.label);
-        discrepancies = nextDiscrepancies;
+        // Only replace the temp list and discrepancies on a full poll. Compact
+        // polls don't emit them and would otherwise blow away the popup's
+        // table mid-session.
+        if (mode === "full") {
+            temps = nextTemps.filter(t => t && t.label);
+            discrepancies = nextDiscrepancies;
+        }
+        const ageS = data.timestamp > 0 ? (Math.floor(Date.now() / 1000) - data.timestamp) : -1;
+        root.log("parseState mode=" + mode
+            + " ts=" + data.timestamp
+            + " age=" + ageS + "s"
+            + " fan_rpm=" + data.fan_rpm
+            + " fan_level=" + data.fan_level
+            + " cpu=" + data.cpu_c
+            + " gpu=" + data.gpu_c
+            + " wifi=" + data.wifi_c);
     }
 
     // ── compact: dots + hottest temp ──────────────────────────────────────
@@ -348,6 +382,7 @@ PlasmoidItem {
                     delegate: ColumnLayout {
                         id: tempBlock
                         required property var modelData
+                        readonly property bool tempOk: tempBlock.modelData.ok !== false
                         Layout.fillWidth: true
                         spacing: Kirigami.Units.smallSpacing / 2
 
@@ -365,8 +400,10 @@ PlasmoidItem {
 
                             PlasmaComponents3.Label {
                                 Layout.fillWidth: true
-                                text: Number(tempBlock.modelData.c).toFixed(1) + "°C / " + root.toF(tempBlock.modelData.c).toFixed(0) + "°F"
-                                color: root.tempColor(tempBlock.modelData.c)
+                                text: tempBlock.tempOk
+                                    ? Number(tempBlock.modelData.c).toFixed(1) + "°C / " + root.toF(tempBlock.modelData.c).toFixed(0) + "°F"
+                                    : "N/A"
+                                color: tempBlock.tempOk ? root.tempColor(tempBlock.modelData.c) : Kirigami.Theme.disabledTextColor
                                 font.family: root.monospaceFamily
                             }
                         }
@@ -384,6 +421,7 @@ PlasmoidItem {
                             }
 
                             Rectangle {
+                                visible: tempBlock.tempOk
                                 anchors.left: parent.left
                                 anchors.top: parent.top
                                 anchors.bottom: parent.bottom
@@ -405,15 +443,29 @@ PlasmoidItem {
         engine: "executable"
         interval: 0
         onNewData: (sourceName, sourceData) => {
-            if (sourceName !== root.currentCommand) return;
-            root.parseState(sourceData.stdout || "");
+            // Accept results from either command — currentCommand can switch
+            // (expanded ↔ collapsed) while a poll is still in flight, and we
+            // don't want to drop a freshly-computed result just because the
+            // UI mode changed mid-fetch.
+            if (sourceName !== root.fullCommand && sourceName !== root.compactCommand) return;
+            const elapsed = root.lastPollStartedMs > 0
+                ? (Date.now() - root.lastPollStartedMs) : -1;
+            const stdout = sourceData.stdout || "";
+            const stderr = sourceData.stderr || "";
+            const exitCode = sourceData.exitCode !== undefined ? sourceData.exitCode : "?";
+            root.log("onNewData src=" + sourceName
+                + " elapsed=" + elapsed + "ms"
+                + " exit=" + exitCode
+                + " stdout.len=" + stdout.length
+                + (stderr ? " stderr=" + JSON.stringify(stderr.slice(0, 200)) : ""));
+            root.parseState(stdout);
             executableSource.disconnectSource(sourceName);
         }
     }
 
     Timer {
         id: pollTimer
-        interval: root.expanded ? root.refreshMs : 30000
+        interval: root.expanded ? root.refreshMs : root.collapsedRefreshMs
         repeat: true
         running: true
         triggeredOnStart: true
@@ -421,11 +473,12 @@ PlasmoidItem {
     }
 
     onExpandedChanged: function() {
-        if (root.expanded) {
-            root.pollNow();
-        } else {
-            executableSource.disconnectSource(root.currentCommand);
-        }
+        // Whether expanding or collapsing, trigger a fresh poll so the new
+        // mode (full ↔ compact) takes effect immediately instead of waiting
+        // for the next timer tick. pollNow() disconnects both sources first,
+        // so no stale in-flight source lingers.
+        root.log("expandedChanged -> " + root.expanded);
+        root.pollNow();
     }
 
     Component.onCompleted: pollNow()
