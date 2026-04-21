@@ -452,6 +452,10 @@ PlasmoidItem {
                 ? (Date.now() - root.lastPollStartedMs) : -1;
             const stdout = sourceData.stdout || "";
             const stderr = sourceData.stderr || "";
+            // "?" sentinel when the DataSource omits exitCode (some Plasma5
+            // versions do this while a process is still being reaped). We
+            // treat unknown as "don't skip" — better to parse possibly-good
+            // stdout than to silently blank the display on missing metadata.
             const exitCode = sourceData.exitCode !== undefined ? sourceData.exitCode : "?";
             root.log("onNewData src=" + sourceName
                 + " elapsed=" + elapsed + "ms"
