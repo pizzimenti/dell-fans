@@ -72,6 +72,18 @@ def invalidate_caches():
     _COOLING_CACHE.clear()
 
 
+def wifi_hw_present():
+    # mt7925_phy0's hwmon symlink periodically goes dangling (ELOOP) during
+    # firmware transitions, which makes the sensor unreadable for a poll or
+    # two. The module/phy sysfs entries are stable, so we use them to tell
+    # "WiFi hardware exists but this read failed" apart from "no WiFi at all."
+    return (
+        os.path.isdir("/sys/module/mt7925_common")
+        or os.path.isdir("/sys/module/mt7925e")
+        or os.path.isdir("/sys/class/ieee80211/phy0")
+    )
+
+
 def read_policy_state():
     parsed = {}
     try:
@@ -87,8 +99,38 @@ def read_policy_state():
     return parsed
 
 
+def collect_compact():
+    # Minimal read path for the system-tray compact representation. The panel
+    # icon only needs the triggerTempC (cpu/gpu/wifi) and the tooltip needs
+    # fan_rpm + fan_level. Everything else the QML can keep at its last known
+    # value from the most recent full poll — the merge-mode parser in main.qml
+    # preserves unset keys across compact polls.
+    lines = ["mode=compact", f"timestamp={int(time.time())}"]
+
+    dell = find_hwmon("dell_smm")
+    fan_rpm = _read_int(f"{dell}/fan1_input") if dell else 0
+    lines.append(f"fan_rpm={fan_rpm}")
+
+    policy_state = read_policy_state()
+    try:
+        fan_level = int(policy_state.get("fan_level", "-1") or "-1")
+    except ValueError:
+        fan_level = -1
+    lines.append(f"fan_level={fan_level}")
+
+    k10    = find_hwmon("k10temp")
+    amdgpu = find_hwmon("amdgpu")
+    wifi   = find_hwmon("mt7925_phy0")
+    cpu_c  = _read_int(f"{k10}/temp1_input")    / 1000.0 if k10    else 0.0
+    gpu_c  = _read_int(f"{amdgpu}/temp1_input") / 1000.0 if amdgpu else 0.0
+    wifi_c = _read_int(f"{wifi}/temp1_input")   / 1000.0 if wifi   else 0.0
+    lines += [f"cpu_c={cpu_c:.1f}", f"gpu_c={gpu_c:.1f}", f"wifi_c={wifi_c:.1f}"]
+
+    print("\n".join(lines))
+
+
 def collect():
-    lines = [f"timestamp={int(time.time())}"]
+    lines = ["mode=full", f"timestamp={int(time.time())}"]
 
     # ── dell_smm (fan + named temps) ─────────────────────────────────────
     dell = find_hwmon("dell_smm")
@@ -178,36 +220,67 @@ def collect():
     cpu_c  = _read_int(f"{k10}/temp1_input")    / 1000.0 if k10    else 0.0
     gpu_c  = _read_int(f"{amdgpu}/temp1_input") / 1000.0 if amdgpu else 0.0
     wifi_c = _read_int(f"{wifi}/temp1_input")   / 1000.0 if wifi   else 0.0
+
     lines += [f"cpu_c={cpu_c:.1f}", f"gpu_c={gpu_c:.1f}", f"wifi_c={wifi_c:.1f}"]
 
     # ── all temps for display ─────────────────────────────────────────────
+    # Entries are (label, temp_c, available). An unavailable row keeps its
+    # slot in the list and renders as "N/A" so the layout doesn't flicker,
+    # but we never show a stale value.
     extra_temps = []
     if k10:
-        extra_temps.append((f"CPU ({_read(f'{k10}/temp1_label', 'Tctl')})", cpu_c))
+        extra_temps.append((f"CPU ({_read(f'{k10}/temp1_label', 'Tctl')})", cpu_c, True))
     if amdgpu:
-        extra_temps.append((f"GPU ({_read(f'{amdgpu}/temp1_label', 'edge')})", gpu_c))
+        extra_temps.append((f"GPU ({_read(f'{amdgpu}/temp1_label', 'edge')})", gpu_c, True))
     nvme = find_hwmon("nvme")
     if nvme:
-        extra_temps.append(("NVMe", _read_int(f"{nvme}/temp1_input") / 1000.0))
-    if wifi_c:
-        extra_temps.append(("WiFi", wifi_c))
+        extra_temps.append(("NVMe", _read_int(f"{nvme}/temp1_input") / 1000.0, True))
+    if wifi_c > 0.0:
+        extra_temps.append(("WiFi", wifi_c, True))
+    elif wifi_hw_present():
+        extra_temps.append(("WiFi", 0.0, False))
     acpitz = find_hwmon("acpitz")
     if acpitz:
         t = _read_int(f"{acpitz}/temp1_input") / 1000.0
         if t:
-            extra_temps.append(("ACPI Zone", t))
+            extra_temps.append(("ACPI Zone", t, True))
 
     seen: set[str] = set()
-    deduped: list[tuple[str, float]] = []
-    for lbl, tc in dell_temps + extra_temps:
+    deduped: list[tuple[str, float, bool]] = []
+    for lbl, tc, ok in [(label, temp_c, True) for label, temp_c in dell_temps] + extra_temps:
         if lbl not in seen:
             seen.add(lbl)
-            deduped.append((lbl, tc))
-    deduped.sort(key=lambda x: x[1], reverse=True)
+            deduped.append((lbl, tc, ok))
+    # Canonical order by policy-relevance so the popup never reshuffles.
+    # The top four are what the fan daemon actually reacts to: CPU (Tctl) and
+    # GPU (edge) drive band transitions, WiFi is the 80°C guardrail, and NVMe
+    # tends to dominate the hottest-component signal on this machine. Rows
+    # hold their slot regardless of value or availability — N/A is rendered
+    # in place by the QML delegate.
+    _canonical_ranks = [
+        lambda label: label.startswith("CPU ("),       # k10temp Tctl
+        lambda label: label.startswith("GPU ("),       # amdgpu edge
+        lambda label: label == "WiFi",
+        lambda label: label == "ACPI Zone",
+        lambda label: label == "Ambient",
+        lambda label: label == "CPU",                  # dell_smm EC reading
+        lambda label: label == "NVMe",
+        lambda label: label == "SODIMM",
+    ]
+    def _rank(label: str) -> int:
+        for i, pred in enumerate(_canonical_ranks):
+            if pred(label):
+                return i
+        return len(_canonical_ranks)
+    deduped.sort(key=lambda x: (_rank(x[0]), x[0]))
 
     lines.append(f"temp_count={len(deduped)}")
-    for i, (lbl, tc) in enumerate(deduped):
-        lines += [f"temp_{i}_label={lbl}", f"temp_{i}_c={tc:.1f}"]
+    for i, (lbl, tc, ok) in enumerate(deduped):
+        lines += [
+            f"temp_{i}_label={lbl}",
+            f"temp_{i}_c={tc:.1f}",
+            f"temp_{i}_ok={1 if ok else 0}",
+        ]
 
     # ── discrepancies ─────────────────────────────────────────────────────
     discrepancies = []
@@ -225,5 +298,26 @@ def collect():
     print("\n".join(lines))
 
 
+def install():
+    # Dev shortcut: drop a per-user entry in ~/.local/bin that points back at
+    # THIS source file, so the plasmoid picks up edits without needing sudo to
+    # re-run setup.sh. Symlink (not copy) — a frozen copy silently goes stale
+    # the moment the source changes and the plasmoid keeps running ancient code.
+    import sys as _sys
+    target = os.path.expanduser("~/.local/bin/fanmon-plasmoid-source")
+    source = os.path.abspath(__file__)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if os.path.islink(target) or os.path.exists(target):
+        os.remove(target)
+    os.symlink(source, target)
+    print(f"Linked fanmon-plasmoid-source -> {source}", file=_sys.stderr)
+
+
 if __name__ == "__main__":
-    collect()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "install":
+        install()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--compact":
+        collect_compact()
+    else:
+        collect()

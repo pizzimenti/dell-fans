@@ -1,0 +1,1 @@
+services/dell-fan-policy/setup.sh
