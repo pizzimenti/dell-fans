@@ -57,8 +57,10 @@ Notes:
   kpackagetool6 -t Plasma/Applet --upgrade plasmoid/org.kde.plasma.dell-fans
   ```
 
-  Then right-click the widget in your panel and pick **Reload**, or log out
-  and back in, so Plasma picks up the new QML.
+  Then remove the widget from the panel and re-add it, restart plasmashell
+  (`systemctl --user restart plasma-plasmashell.service`), or log out and
+  back in so Plasma picks up the new QML. Plasma 6 has no per-widget
+  "Reload" action — see the note further down.
 - If you only changed the daemon or Python scripts, a `sudo systemctl restart
   dell-fan-policy.service` is enough after the installer copies the new files
   into place.

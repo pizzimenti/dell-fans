@@ -458,6 +458,15 @@ PlasmoidItem {
                 + " exit=" + exitCode
                 + " stdout.len=" + stdout.length
                 + (stderr ? " stderr=" + JSON.stringify(stderr.slice(0, 200)) : ""));
+            // Guard against failed polls: an empty or non-zero-exit stdout
+            // would otherwise default mode="full" inside parseState() and
+            // wipe the popup's last-known temps/discrepancies. Keep the
+            // previous data visible instead — a single failed poll is far
+            // less confusing than a blanked-out table.
+            if ((exitCode !== 0 && exitCode !== "?") || stdout.length === 0) {
+                executableSource.disconnectSource(sourceName);
+                return;
+            }
             root.parseState(stdout);
             executableSource.disconnectSource(sourceName);
         }

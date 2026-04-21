@@ -83,8 +83,8 @@ run_as_user_in_session() {
 upgrade_or_install_plasmoid() {
     local plasmoid_dir="$1"
     local plugin_id="$2"
-    local canonical_dir
-    local user_plasmoid_dir="$(target_user_home)/.local/share/plasma/plasmoids/$plugin_id"
+    local canonical_dir user_plasmoid_dir
+    user_plasmoid_dir="$(target_user_home)/.local/share/plasma/plasmoids/$plugin_id"
     canonical_dir="$(realpath "$plasmoid_dir")"
 
     # If a dev symlink at ~/.local/share/plasma/plasmoids/<id> points back at
@@ -209,8 +209,7 @@ restart_plasmashell_if_running() {
             # Wait up to 5s for plasmashell to actually come back, so we can
             # report honestly and so the user doesn't see an empty panel while
             # wondering whether setup.sh succeeded.
-            local i
-            for i in $(seq 1 25); do
+            for _ in $(seq 1 25); do
                 if pgrep -u "$uid" -x plasmashell >/dev/null 2>&1; then
                     echo "  plasmashell restarted."
                     return 0

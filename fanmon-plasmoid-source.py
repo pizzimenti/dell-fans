@@ -247,7 +247,7 @@ def collect():
 
     seen: set[str] = set()
     deduped: list[tuple[str, float, bool]] = []
-    for lbl, tc, ok in [(l, c, True) for l, c in dell_temps] + extra_temps:
+    for lbl, tc, ok in [(label, temp_c, True) for label, temp_c in dell_temps] + extra_temps:
         if lbl not in seen:
             seen.add(lbl)
             deduped.append((lbl, tc, ok))
@@ -258,16 +258,16 @@ def collect():
     # hold their slot regardless of value or availability — N/A is rendered
     # in place by the QML delegate.
     _canonical_ranks = [
-        lambda l: l.startswith("CPU ("),       # k10temp Tctl
-        lambda l: l.startswith("GPU ("),       # amdgpu edge
-        lambda l: l == "WiFi",
-        lambda l: l == "ACPI Zone",
-        lambda l: l == "Ambient",
-        lambda l: l == "CPU",                  # dell_smm EC reading
-        lambda l: l == "NVMe",
-        lambda l: l == "SODIMM",
+        lambda label: label.startswith("CPU ("),       # k10temp Tctl
+        lambda label: label.startswith("GPU ("),       # amdgpu edge
+        lambda label: label == "WiFi",
+        lambda label: label == "ACPI Zone",
+        lambda label: label == "Ambient",
+        lambda label: label == "CPU",                  # dell_smm EC reading
+        lambda label: label == "NVMe",
+        lambda label: label == "SODIMM",
     ]
-    def _rank(label):
+    def _rank(label: str) -> int:
         for i, pred in enumerate(_canonical_ranks):
             if pred(label):
                 return i
