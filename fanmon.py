@@ -238,12 +238,13 @@ def collect() -> dict:
         # The "Composite" reading and PCB-side sensors run several degrees
         # cooler and hide real headroom loss.
         hottest = 0
-        for entry in os.listdir(nvme):
-            if not (entry.startswith("temp") and entry.endswith("_input")):
-                continue
-            t = _read_int(f"{nvme}/{entry}")
-            if t > hottest:
-                hottest = t
+        try:
+            for entry in os.listdir(nvme):
+                if not (entry.startswith("temp") and entry.endswith("_input")):
+                    continue
+                hottest = max(hottest, _read_int(f"{nvme}/{entry}"))
+        except OSError:
+            hottest = 0
         if hottest:
             extra_temps.append({"label": "NVMe (SSD core)", "temp_c": hottest / 1000.0, "source": "nvme"})
     if data["wifi_c"]:
