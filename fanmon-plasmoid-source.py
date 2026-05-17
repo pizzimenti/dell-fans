@@ -234,7 +234,20 @@ def collect():
         extra_temps.append((f"GPU ({_read(f'{amdgpu}/temp1_label', 'edge')})", gpu_c, True))
     nvme = find_hwmon("nvme")
     if nvme:
-        extra_temps.append(("NVMe", _read_int(f"{nvme}/temp1_input") / 1000.0, True))
+        # Emit only the hottest sensor exposed by the drive — that's the
+        # controller / NAND die, which is what trips NVMe thermal throttling.
+        # The "Composite" reading and PCB-side sensors run several degrees
+        # cooler and hide real headroom loss.
+        hottest = 0
+        try:
+            for entry in os.listdir(nvme):
+                if not (entry.startswith("temp") and entry.endswith("_input")):
+                    continue
+                hottest = max(hottest, _read_int(f"{nvme}/{entry}"))
+        except OSError:
+            hottest = 0
+        if hottest:
+            extra_temps.append(("NVMe (SSD core)", hottest / 1000.0, True))
     if wifi_c > 0.0:
         extra_temps.append(("WiFi", wifi_c, True))
     elif wifi_hw_present():
@@ -264,7 +277,7 @@ def collect():
         lambda label: label == "ACPI Zone",
         lambda label: label == "Ambient",
         lambda label: label == "CPU",                  # dell_smm EC reading
-        lambda label: label == "NVMe",
+        lambda label: label.startswith("NVMe"),
         lambda label: label == "SODIMM",
     ]
     def _rank(label: str) -> int:

@@ -4,6 +4,26 @@ All notable changes to this project are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-05-15
+
+### Changed
+
+- **NVMe row now reports the hottest on-drive sensor as a single line.**
+  Previously fanmon and the plasmoid showed only `temp1_input` (Composite),
+  which on this hardware tracks the cooler PCB-side sensor; the hotter
+  controller die (`Sensor 1`) is what actually trips NVMe thermal
+  throttling. An earlier internal iteration tried emitting one row per
+  sensor (`Composite`, `Sensor 1`, `Sensor 2`), but the extra rows pushed
+  `SODIMM` off the bottom of the TUI on shorter terminals and most rows
+  duplicated cooler PCB-side readings. Both `fanmon.py` and
+  `fanmon-plasmoid-source.py` now scan all `temp*_input` files under the
+  NVMe hwmon, take the maximum, and emit a single row labelled
+  `NVMe (SSD core)` — the only number that actually matters for
+  throttling. Sysfs enumeration is guarded against transient hwmon races
+  (suspend/resume, hotplug) so the poll degrades gracefully instead of
+  crashing. The plasmoid's canonical ranking treats any `NVMe (…)` label
+  as a single rank slot so ordering is unchanged.
+
 ## [0.2.0] — 2026-04-21
 
 ### Added

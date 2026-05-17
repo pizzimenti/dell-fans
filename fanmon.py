@@ -233,8 +233,20 @@ def collect() -> dict:
         extra_temps.append({"label": f"GPU ({label})", "temp_c": data["gpu_c"], "source": "amdgpu"})
     nvme = find_hwmon("nvme")
     if nvme:
-        t = _read_int(f"{nvme}/temp1_input")
-        extra_temps.append({"label": "NVMe", "temp_c": t / 1000.0, "source": "nvme"})
+        # Emit only the hottest sensor exposed by the drive — that's the
+        # controller / NAND die, which is what trips NVMe thermal throttling.
+        # The "Composite" reading and PCB-side sensors run several degrees
+        # cooler and hide real headroom loss.
+        hottest = 0
+        try:
+            for entry in os.listdir(nvme):
+                if not (entry.startswith("temp") and entry.endswith("_input")):
+                    continue
+                hottest = max(hottest, _read_int(f"{nvme}/{entry}"))
+        except OSError:
+            hottest = 0
+        if hottest:
+            extra_temps.append({"label": "NVMe (SSD core)", "temp_c": hottest / 1000.0, "source": "nvme"})
     if data["wifi_c"]:
         extra_temps.append({"label": "WiFi", "temp_c": data["wifi_c"], "source": "wifi"})
     acpitz = find_hwmon("acpitz")
