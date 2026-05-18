@@ -17,6 +17,8 @@ readonly POLL_FAST_SECONDS="${POLL_FAST_SECONDS:-1}"
 readonly POLL_SLOW_SECONDS="${POLL_SLOW_SECONDS:-3}"
 readonly LOW_SETTLED_RPM_MARGIN="${LOW_SETTLED_RPM_MARGIN:-500}"                  # LOW timers start only after RPM is near target
 readonly LOW_MISMATCH_RPM_MARGIN="${LOW_MISMATCH_RPM_MARGIN:-1500}"               # LOW mismatch if RPM stays this far above target
+readonly OFF_MISMATCH_RPM_MARGIN="${OFF_MISMATCH_RPM_MARGIN:-1500}"               # OFF mismatch if RPM stays above this with no command
+readonly OFF_COAST_DOWN_SECONDS="${OFF_COAST_DOWN_SECONDS:-30}"                   # Skip OFF mismatch detection for this long after entering OFF (coast-down)
 readonly MISMATCH_RECOVERY_POLLS="${MISMATCH_RECOVERY_POLLS:-3}"                  # consecutive mismatch polls before corrective action
 readonly MISMATCH_RECOVERY_COOLDOWN_SECONDS="${MISMATCH_RECOVERY_COOLDOWN_SECONDS:-20}"
 readonly MISMATCH_RECOVERY_SETTLE_SECONDS="${MISMATCH_RECOVERY_SETTLE_SECONDS:-1}"
@@ -64,7 +66,9 @@ write_runtime_state() {
     local medium_elapsed_ms="$8"
     local cmd_state="$9"
     local hw_state="${10}"
-    local path="${11:-$STATE_PATH}"
+    local off_mismatch="${11:-0}"
+    local pwm_enable="${12:-1}"
+    local path="${13:-$STATE_PATH}"
     local tmp
 
     mkdir -p "$STATE_DIR"
@@ -81,6 +85,8 @@ write_runtime_state() {
         printf 'medium_elapsed_ms=%s\n' "$medium_elapsed_ms"
         printf 'cmd_state=%s\n' "$cmd_state"
         printf 'hw_level=%s\n' "$hw_state"
+        printf 'off_mismatch=%s\n' "$off_mismatch"
+        printf 'pwm_enable=%s\n' "$pwm_enable"
     } >"$tmp"
     chmod 0644 "$tmp"
     mv "$tmp" "$path"
@@ -202,6 +208,22 @@ recover_fan_state_mismatch() {
     set_fan_state "$desired_state"
 }
 
+recover_fan_off_mismatch() {
+    local before_rpm="$1"
+    local before_hw_state="$2"
+
+    log "Attempting OFF mismatch recovery hw_state=${before_hw_state} rpm=${before_rpm}"
+    enable_manual_mode
+    set_fan_state 0
+    # Re-assert PWM=0 directly — on Dell SMM the firmware sometimes spins
+    # the fan up unsolicited despite cur_state=0. A second touch of pwm1
+    # often shakes it loose without bouncing through LOW (which would
+    # briefly drive the fan up, defeating the point).
+    if [[ -n "$hwmon_dir" && -w "$hwmon_dir/pwm1" ]]; then
+        printf '0\n' >"$hwmon_dir/pwm1" || true
+    fi
+}
+
 handle_signal_exit() {
     restore_bios_auto
     exit 0
@@ -258,6 +280,10 @@ read_pwm_value() {
     read_first_line "$hwmon_dir/pwm1" 2>/dev/null || printf '0\n'
 }
 
+read_pwm_enable() {
+    read_first_line "$hwmon_dir/pwm1_enable" 2>/dev/null || printf '0\n'
+}
+
 read_hw_fan_state() {
     if [[ "$control_file" == /sys/class/thermal/cooling_device* ]]; then
         read_first_line "$control_file" 2>/dev/null || printf '%s\n' "$current_state"
@@ -271,6 +297,12 @@ is_low_fan_mismatch() {
     local target="$2"
     local hw_state="$3"
     (( hw_state == 1 && target > 0 && rpm > target + LOW_MISMATCH_RPM_MARGIN ))
+}
+
+is_off_fan_mismatch() {
+    local rpm="$1"
+    local hw_state="$2"
+    (( hw_state == 0 && rpm > OFF_MISMATCH_RPM_MARGIN ))
 }
 
 desired_state() {
@@ -426,7 +458,9 @@ main() {
     enable_manual_mode
 
     local cpu_raw gpu_raw wifi_raw cpu_c gpu_c wifi_c
-    local fan_rpm fan_target pwm_value hw_fan_state cmd_state last_cmd_state=-1 low_fan_mismatch=0
+    local fan_rpm fan_target pwm_value pwm_enable_value hw_fan_state cmd_state last_cmd_state=-1 low_fan_mismatch=0
+    local off_fan_mismatch=0 off_mismatch_polls=0 last_off_recovery_epoch=0
+    local off_mismatch_recovery_cooldown_ms off_entered_epoch=0 off_elapsed_ms=0
     local mismatch_polls=0 last_recovery_epoch=0 medium_phase=0
     local current_state next_state now medium_entered_epoch=0 medium_elapsed_ms=0
     local mismatch_recovery_cooldown_ms summary_interval_ms poll_sleep_seconds
@@ -436,6 +470,7 @@ main() {
     local last_telemetry_epoch=0 prev_logged_state=-1 prev_logged_cmd_state=-1 prev_policy_rule=""
 
     mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
+    off_mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
     summary_interval_ms="$(seconds_to_ms "$SUMMARY_INTERVAL_SECONDS")"
 
     current_state=0
@@ -467,6 +502,7 @@ main() {
         fan_rpm="$(read_fan_rpm)"
         fan_target="$(read_fan_target)"
         pwm_value="$(read_pwm_value)"
+        pwm_enable_value="$(read_pwm_enable)"
         hw_fan_state="$(read_hw_fan_state)"
 
         now="$(now_ms)"
@@ -482,6 +518,30 @@ main() {
         else
             low_fan_mismatch=0
             mismatch_polls=0
+        fi
+
+        if (( current_state == 0 )); then
+            if (( off_entered_epoch == 0 )); then
+                off_entered_epoch="$now"
+            fi
+            off_elapsed_ms=$(( now - off_entered_epoch ))
+            # Skip the coast-down window — a fan dropping from LOW/HIGH to OFF
+            # can take 10–30 s to spin down through the 1500 RPM mismatch
+            # threshold. Only flag a mismatch once we're past that window
+            # (i.e., a spinup from genuine rest).
+            if (( off_elapsed_ms >= OFF_COAST_DOWN_SECONDS * 1000 )) \
+               && is_off_fan_mismatch "$fan_rpm" "$hw_fan_state"; then
+                off_fan_mismatch=1
+                off_mismatch_polls=$(( off_mismatch_polls + 1 ))
+            else
+                off_fan_mismatch=0
+                off_mismatch_polls=0
+            fi
+        else
+            off_entered_epoch=0
+            off_elapsed_ms=0
+            off_fan_mismatch=0
+            off_mismatch_polls=0
         fi
 
         if (( current_state == 3 )); then
@@ -505,6 +565,13 @@ main() {
             else
                 medium_entered_epoch=0
                 medium_elapsed_ms=0
+            fi
+            if (( current_state == 0 )); then
+                off_entered_epoch="$now"
+                off_elapsed_ms=0
+            else
+                off_entered_epoch=0
+                off_elapsed_ms=0
             fi
         fi
 
@@ -533,6 +600,7 @@ main() {
                 fan_rpm="$(read_fan_rpm)"
                 fan_target="$(read_fan_target)"
                 pwm_value="$(read_pwm_value)"
+                pwm_enable_value="$(read_pwm_enable)"
                 hw_fan_state="$(read_hw_fan_state)"
                 if is_low_fan_mismatch "$fan_rpm" "$fan_target" "$hw_fan_state"; then
                     low_fan_mismatch=1
@@ -540,6 +608,29 @@ main() {
             fi
         else
             mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
+        fi
+
+        if (( current_state == 0 && off_fan_mismatch )); then
+            if (( off_mismatch_polls >= MISMATCH_RECOVERY_POLLS \
+               && now - last_off_recovery_epoch >= off_mismatch_recovery_cooldown_ms )); then
+                recover_fan_off_mismatch "$fan_rpm" "$hw_fan_state"
+                last_off_recovery_epoch="$now"
+                off_mismatch_polls=0
+                recovery_events=$(( recovery_events + 1 ))
+                off_mismatch_recovery_cooldown_ms=$(( off_mismatch_recovery_cooldown_ms * 2 ))
+                if (( off_mismatch_recovery_cooldown_ms > MISMATCH_RECOVERY_MAX_COOLDOWN_SECONDS * 1000 )); then
+                    off_mismatch_recovery_cooldown_ms=$(( MISMATCH_RECOVERY_MAX_COOLDOWN_SECONDS * 1000 ))
+                fi
+                fan_rpm="$(read_fan_rpm)"
+                pwm_value="$(read_pwm_value)"
+                pwm_enable_value="$(read_pwm_enable)"
+                hw_fan_state="$(read_hw_fan_state)"
+                if is_off_fan_mismatch "$fan_rpm" "$hw_fan_state"; then
+                    off_fan_mismatch=1
+                fi
+            fi
+        else
+            off_mismatch_recovery_cooldown_ms="$(seconds_to_ms "$MISMATCH_RECOVERY_COOLDOWN_SECONDS")"
         fi
 
         policy_rule="$(policy_rule_label "$current_state" "$cpu_c" "$gpu_c" "$wifi_c" "$medium_elapsed_ms")"
@@ -558,7 +649,7 @@ main() {
             telemetry_due=1
         fi
         if (( telemetry_due )); then
-            log "telemetry cpu=${cpu_c}C gpu=${gpu_c}C wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} medium_elapsed_ms=${medium_elapsed_ms} low_mismatch=${low_fan_mismatch} mismatch_polls=${mismatch_polls} policy_rule=${policy_rule} threshold_bucket=${threshold_bucket}"
+            log "telemetry cpu=${cpu_c}C gpu=${gpu_c}C wifi=${wifi_c}C state=${current_state} cmd_state=${cmd_state} hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value} pwm_enable=${pwm_enable_value} medium_elapsed_ms=${medium_elapsed_ms} off_elapsed_ms=${off_elapsed_ms} low_mismatch=${low_fan_mismatch} off_mismatch=${off_fan_mismatch} mismatch_polls=${mismatch_polls} off_mismatch_polls=${off_mismatch_polls} policy_rule=${policy_rule} threshold_bucket=${threshold_bucket}"
             last_telemetry_epoch="$now"
             prev_logged_state="$current_state"
             prev_logged_cmd_state="$cmd_state"
@@ -566,6 +657,10 @@ main() {
         fi
         if (( low_fan_mismatch )); then
             log "WARNING: LOW mismatch hw_state=${hw_fan_state} rpm=${fan_rpm} target=${fan_target} pwm=${pwm_value}"
+            mismatch_events=$(( mismatch_events + 1 ))
+        fi
+        if (( off_fan_mismatch )); then
+            log "WARNING: OFF mismatch hw_state=${hw_fan_state} rpm=${fan_rpm} pwm=${pwm_value}"
             mismatch_events=$(( mismatch_events + 1 ))
         fi
         write_runtime_state \
@@ -578,7 +673,9 @@ main() {
             "$policy_rule" \
             "$medium_elapsed_ms" \
             "$cmd_state" \
-            "$hw_fan_state"
+            "$hw_fan_state" \
+            "$off_fan_mismatch" \
+            "$pwm_enable_value"
         summary_samples=$(( summary_samples + 1 ))
         sum_cpu=$(( sum_cpu + cpu_c ))
         sum_gpu=$(( sum_gpu + gpu_c ))

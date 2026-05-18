@@ -303,6 +303,18 @@ def collect():
         )
     if fan_target > 200 and fan_rpm < fan_target * 0.6:
         discrepancies.append(f"RPM lag: {fan_rpm:,} vs target {fan_target:,}")
+    # Prefer the daemon's coast-down-aware flag; fall back to a local check
+    # only if the daemon predates the field.
+    daemon_off_flag = policy_state.get("off_mismatch")
+    if daemon_off_flag is not None:
+        if daemon_off_flag == "1":
+            discrepancies.append(
+                f"Fan spinning {fan_rpm:,} RPM despite OFF — firmware override"
+            )
+    elif fan_level == 0 and fan_rpm > 1500:
+        discrepancies.append(
+            f"Fan spinning {fan_rpm:,} RPM despite OFF — firmware override"
+        )
 
     lines.append(f"discrepancy_count={len(discrepancies)}")
     for i, msg in enumerate(discrepancies):

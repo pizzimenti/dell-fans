@@ -4,6 +4,49 @@ All notable changes to this project are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-05-18
+
+### Added
+
+- **OFF-state fan mismatch detection in the daemon, with a coast-down
+  grace window.** Until this release the daemon only watched for LOW
+  mismatches (commit 356ab16). On this hardware the Dell SMM firmware
+  occasionally spins the fan up to ~3 k RPM for a poll or two even when
+  the daemon has commanded OFF (`pwm1=0`, `cooling_device cur_state=0`,
+  `fan1_target=0`), producing a TUI screenshot that looked broken but
+  carried no warning. The daemon now tracks `off_entered_epoch` /
+  `off_elapsed_ms`, ignores any RPM above `OFF_MISMATCH_RPM_MARGIN`
+  (1500) for the first `OFF_COAST_DOWN_SECONDS` (30 s) after a
+  transition into OFF — so a fan spinning down from HIGH/LOW doesn't
+  trip false positives — and flags `off_mismatch=1` once we're past
+  that window and the RPM still sits above the threshold. After three
+  consecutive flagged polls (with the same exponential cooldown the
+  LOW path uses, 20 s → 5 min cap) it re-asserts `pwm1=0` directly via
+  the `recover_fan_off_mismatch` routine. Recovery deliberately does
+  **not** bounce through LOW (which would briefly drive the fan up,
+  defeating the point).
+- **`pwm1_enable` is now logged every poll and persisted to the state
+  file.** The screenshot incident was investigated with no way to tell
+  whether the SMM firmware was overriding us while `pwm1_enable=1`
+  (real EC quirk) or whether `pwm1_enable` had transiently flipped to
+  `2`/`3` (something stripping manual mode). The new
+  `pwm_enable=<n>` field in telemetry and `pwm_enable=<n>` key in
+  `/run/dell-fan-policy/state` make that distinction visible the next
+  time an event occurs. The existing `pwm1_enable != 1` discrepancy in
+  fanmon and the plasmoid already surfaces non-manual mode to the user.
+- **`off_elapsed_ms` in telemetry**, parallel to `medium_elapsed_ms`,
+  so the coast-down gating is auditable from the journal.
+
+### Changed
+
+- **fanmon and the plasmoid prefer the daemon's gated `off_mismatch`
+  flag over a local RPM threshold.** Both now read `off_mismatch` from
+  the state file; when present, they trust the daemon's coast-down-aware
+  decision. A local fallback (`fan_level == 0 && rpm > 1500`) remains
+  for compatibility with older daemons but is no longer the primary
+  signal. Result: no more spurious "fan spinning despite OFF"
+  discrepancies during normal LOW→OFF transitions.
+
 ## [0.2.2] — 2026-05-15
 
 ### Changed

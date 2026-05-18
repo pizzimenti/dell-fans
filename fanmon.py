@@ -196,6 +196,19 @@ def collect() -> dict:
         discrepancies.append(
             f"LOW commanded but fan is still spinning down: {rpm:,} vs target {target:,}"
         )
+    # OFF mismatch: trust the daemon's coast-down-aware flag if present
+    # (off_mismatch=1 means the daemon already filtered out spin-down).
+    # Fall back to a local check only if the daemon predates this field.
+    daemon_off_flag = policy_state.get("off_mismatch")
+    if daemon_off_flag is not None:
+        if daemon_off_flag == "1":
+            discrepancies.append(
+                f"Fan spinning {rpm:,} RPM despite OFF — firmware override"
+            )
+    elif data["fan_level"] == 0 and rpm > LOW_MISMATCH_RPM_MARGIN:
+        discrepancies.append(
+            f"Fan spinning {rpm:,} RPM despite OFF — firmware override (transient)"
+        )
     # Sanity: cooling device state should match fan_level
     hw = data.get("hw_level", -1)
     cmd = data.get("cmd_state", hw)
