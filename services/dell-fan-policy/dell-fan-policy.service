@@ -1,9 +1,28 @@
 [Unit]
 Description=Dell userspace fan policy daemon
 After=multi-user.target
+# Stop trying after 5 restarts in an hour. A daemon that wedges this
+# persistently is better left dead than flapped forever: ExecStopPost= puts the
+# fan back on the BIOS curve, which is the hardware's shipped behaviour.
+StartLimitIntervalSec=1h
+StartLimitBurst=5
 
 [Service]
-Type=simple
+# Manual fan control is not fail-safe — while pwm1_enable=1 the hardware holds
+# the last commanded level and never falls back to the BIOS curve on its own.
+# The exit traps in the daemon cover every way it can *exit*; they do nothing
+# for a daemon that stops polling without exiting (e.g. a blocking sysfs read
+# against an unresponsive EC), which would leave the fan pinned while
+# temperatures climb. WatchdogSec= closes exactly that gap: the poll loop pings
+# via sd_notify each time it publishes runtime state, and if those pings stop
+# systemd kills the unit — running ExecStopPost=, which restores BIOS auto —
+# and restarts it.
+#
+# NotifyAccess=all is required because systemd-notify runs as a child of the
+# daemon, not the main PID; the default (main) would drop every ping.
+Type=notify
+NotifyAccess=all
+WatchdogSec=30s
 ExecStart=/usr/local/sbin/dell-fan-policy
 ExecStopPost=/bin/sh -c 'for d in /sys/class/hwmon/hwmon*; do [ "$$(cat $$d/name 2>/dev/null)" = "dell_smm" ] && echo 2 > $$d/pwm1_enable && break; done'
 SuccessExitStatus=143

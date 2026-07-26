@@ -4,6 +4,77 @@ All notable changes to this project are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] — 2026-07-26
+
+### Added
+
+- **systemd watchdog on the poll loop.** Manual fan control is not
+  fail-safe — while `pwm1_enable=1` the hardware holds the last
+  commanded level and never falls back to the BIOS curve on its own.
+  Every path by which the daemon can *exit* was already covered three
+  times (the `EXIT` trap, the `INT`/`TERM`/`HUP` traps, and
+  `ExecStopPost=`, which runs however the main process died, `SIGKILL`
+  and OOM included). The uncovered case was a daemon that stops polling
+  *without* exiting — a blocking sysfs read against an unresponsive EC,
+  for instance: no trap fires, `systemctl is-active` still reports
+  active, and the fan stays pinned at its last level while temperatures
+  climb. The unit is now `Type=notify` with `WatchdogSec=30s`, and the
+  poll loop pings via `sd_notify` on every runtime-state publish. If the
+  pings stop, systemd kills the unit — running `ExecStopPost=`, which
+  restores BIOS auto — and restarts it. `StartLimitBurst=5` /
+  `StartLimitIntervalSec=1h` bound the retries; past that the daemon is
+  left dead on the BIOS curve rather than flapping.
+  `NotifyAccess=all` is required because `systemd-notify` runs as a
+  child of the daemon rather than as the main PID.
+
+  An earlier draft of this change was a standalone `dell-fan-watchdog`
+  script, unit and timer that polled `pwm1_enable`, classified the
+  system, and sent desktop notifications. It was discarded: it
+  re-implemented in ~250 lines of shell what `WatchdogSec=` does in
+  three lines of unit file, and most of what it detected
+  (manual mode with the service inactive) was already handled by
+  `ExecStopPost=`.
+
+### Fixed
+
+- **The daemon stopped publishing runtime state during sensor faults.**
+  Both degraded paths in the poll loop (`CPU sensor unavailable` /
+  `GPU sensor unavailable`) force max fan and then `continue`, skipping
+  the `write_runtime_state` call at the bottom of the loop. A persistent
+  sensor fault therefore froze `/run/dell-fan-policy/state` at its last
+  good value while the daemon was very much alive and deliberately
+  holding max fan — so the plasmoid and fanmon showed stale
+  temperatures with no indication they were stale. Both paths now emit a
+  heartbeat via `write_sensor_fault_state`, publishing temperatures as
+  `0` with `policy_rule=sensor_fault` rather than a stale last-known
+  value, so nobody mistakes them for a live reading. This is also
+  load-bearing for the watchdog above: without it, a sensor fault would
+  stop the liveness pings and systemd would kill a daemon that is
+  degraded but behaving exactly as designed.
+
+### Removed
+
+- **`/etc/udev/rules.d/99-dell-fan-manual.rules`** (an out-of-tree file
+  on the maintainer's machine — never shipped by this repo, but worth
+  recording in case anyone else hand-rolled the same thing). The rule
+  was:
+
+  ```
+  SUBSYSTEM=="hwmon", DEVPATH=="/devices/platform/dell_smm_hwmon/hwmon/*", \
+    ATTR{name}=="dell_smm", ATTR{pwm1_enable}="1"
+  ```
+
+  It forced `pwm1_enable=1` on every hwmon device-add — every boot,
+  every module reload — regardless of whether the daemon was running.
+  That is fail-dangerous in exactly the way this release is about: it
+  manufactures unowned manual fan control, where the hardware holds the
+  last commanded level and never falls back to the BIOS curve. Disabling
+  `dell-fan-policy.service` on such a machine would have produced a
+  system that boots into manual mode with nothing driving the fan. It
+  was also redundant — `enable_manual_mode()` in the daemon asserts
+  manual mode at startup and again during mismatch recovery, and only
+  ever does so when there is something to drive it.
+
 ## [0.2.3] — 2026-05-18
 
 ### Added

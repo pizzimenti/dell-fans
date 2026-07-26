@@ -157,6 +157,47 @@ The daemon (`dell-fan-policy.sh`) drives a stepped fan policy from CPU and GPU t
 - Runtime state is written to `/run/dell-fan-policy/state` for consumers.
 - BIOS auto mode is restored on daemon exit.
 - The daemon restarts automatically after suspend/resume.
+- A systemd watchdog restarts it if the poll loop stops — see below.
+
+### Watchdog
+
+Manual fan control is not fail-safe. While `pwm1_enable=1` the hardware holds
+whatever level was last commanded; it does **not** revert to the BIOS curve if
+whatever set it goes away. So a daemon that dies with the fan grabbed is a
+thermal risk, not a cosmetic bug.
+
+Every way the daemon can *exit* is already covered three times over: an `EXIT`
+trap, `INT`/`TERM`/`HUP` traps, and `ExecStopPost=` in the unit (which runs no
+matter how the main process died, including `SIGKILL` and OOM). `pwm1_enable`
+also doesn't survive a reboot, so a panic or power cut self-heals.
+
+The gap is a daemon that *stops polling without exiting* — a blocking sysfs read
+against an unresponsive EC, say. No trap fires, `systemctl is-active` still says
+active, and the fan sits pinned at its last level while temperatures climb.
+
+That's what `WatchdogSec=30s` in the unit is for. The poll loop pings systemd
+via `sd_notify` each time it publishes runtime state; if the pings stop, systemd
+kills the unit — running `ExecStopPost=`, which restores BIOS auto — and
+restarts it. `StartLimitBurst=5` / `StartLimitIntervalSec=1h` stop it flapping:
+a daemon that wedges five times in an hour is left dead on the BIOS curve, which
+is the hardware's shipped behaviour. Bring it back with:
+
+```bash
+sudo systemctl start dell-fan-policy
+```
+
+The ping lives inside `write_runtime_state` rather than at its call sites, so
+publishing state and proving liveness cannot drift apart — including on the
+sensor-fault heartbeat path, which must keep pinging or systemd would kill a
+daemon that is degraded but working exactly as designed.
+
+> **If you hand-rolled a udev rule to force manual mode, remove it.** A rule
+> like `ATTR{name}=="dell_smm", ATTR{pwm1_enable}="1"` asserts manual control on
+> every device-add — every boot, every module reload — whether or not the daemon
+> is running. That manufactures precisely the unowned-manual-mode hazard
+> described above, and it's redundant: `enable_manual_mode()` already asserts it
+> at daemon startup and during mismatch recovery, and only when something is
+> there to drive the fan.
 
 ## Terminal Monitor
 

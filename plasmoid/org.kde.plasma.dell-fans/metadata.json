@@ -20,7 +20,7 @@
         "Id": "org.kde.plasma.dell-fans",
         "License": "MIT",
         "Name": "dell-fans",
-        "Version": "0.2.3",
+        "Version": "0.2.4",
         "Website": "https://local"
     }
 }
