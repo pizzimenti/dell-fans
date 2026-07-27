@@ -173,6 +173,12 @@ def collect() -> dict:
         data["hw_level"]      = -1
     data["cmd_state"] = int(policy_state.get("cmd_state", data["hw_level"]) or data["hw_level"])
     data["medium_elapsed_ms"] = int(policy_state.get("medium_elapsed_ms", "0") or 0)
+    # Carried through so active_rule_indexes() can short-circuit on
+    # sensor_fault. Without this the daemon's rule never reaches the selector
+    # and fanmon silently re-derives a band from temperatures the daemon has
+    # already told us are placeholders. Defaults to "" for older daemons whose
+    # state file predates the key.
+    data["policy_rule"] = policy_state.get("policy_rule", "")
 
     # ── discrepancy detection ───────────────────────────────────────────────
     discrepancies = []
