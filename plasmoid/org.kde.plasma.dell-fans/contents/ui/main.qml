@@ -511,9 +511,15 @@ PlasmoidItem {
     Plasmoid.icon: "temperature-normal"
 
     toolTipMainText: "dell-fans  " + levelDots(data.fan_level) + "  " + levelName(data.fan_level)
+    // During a sensor fault the state file carries 0 placeholders rather than
+    // readings, so formatting triggerTempC would report a confident 32°F on a
+    // machine whose temperature is in fact unknown.
     toolTipSubText: root.stale || root.data.fan_level < 0
         ? "No recent fan data"
-        : data.fan_rpm.toLocaleString() + " RPM"
-          + "\n" + toF(triggerTempC).toFixed(0) + "°F"
+        : root.data.policy_rule === "sensor_fault"
+          ? data.fan_rpm.toLocaleString() + " RPM"
+            + "\n" + "Temps unavailable — sensor fault"
+          : data.fan_rpm.toLocaleString() + " RPM"
+            + "\n" + toF(triggerTempC).toFixed(0) + "°F"
     toolTipTextFormat: Text.PlainText
 }

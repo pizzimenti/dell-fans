@@ -118,6 +118,13 @@ def collect_compact():
         fan_level = -1
     lines.append(f"fan_level={fan_level}")
 
+    # Carry policy_rule through the compact path as well. The QML parser merges
+    # compact polls over the last full poll, preserving unset keys — so omitting
+    # this would leave the previous rule on screen for a fault that starts while
+    # the widget is collapsed, and the tooltip would keep formatting the state
+    # file's 0 placeholders as a real temperature.
+    lines.append(f"policy_rule={policy_state.get('policy_rule', '')}")
+
     k10    = find_hwmon("k10temp")
     amdgpu = find_hwmon("amdgpu")
     wifi   = find_hwmon("mt7925_phy0")

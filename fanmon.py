@@ -351,8 +351,8 @@ def build_criteria(data: dict) -> list[dict]:
         "header": "SENSOR FAULT - forcing max fan",
         "logic": "info",
         "rows": [
-            _row(True, "CPU/GPU temp read", None, None, "",
-                 note="unavailable - temps shown as 0 are placeholders"),
+            _row(met=True, label="CPU/GPU temp read", value=None, threshold=None,
+                 unit="", note="unavailable - temps shown as 0 are placeholders"),
         ],
     })
 
