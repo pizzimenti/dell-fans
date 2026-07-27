@@ -101,11 +101,17 @@ write_runtime_state() {
 # consumers are expected to branch on sensor_fault rather than plot the zeros.
 write_sensor_fault_state() {
     local fan_state="$1"
-    local rpm pwm_value pwm_enable_value
+    local rpm pwm_value pwm_enable_value hw_state
 
     rpm="$(read_fan_rpm)"
     pwm_value="$(read_pwm_value)"
     pwm_enable_value="$(read_pwm_enable)"
+    # Report what the hardware actually reports, not what we asked for.
+    # Passing fan_state here would make hw_level equal cmd_state by
+    # construction, hiding the firmware mismatch the normal poll loop exists to
+    # detect — a sensor fault is exactly when that discrepancy matters most,
+    # since temperatures are no longer available to reason about.
+    hw_state="$(read_hw_fan_state)"
 
     write_runtime_state \
         0 0 0 \
@@ -115,7 +121,7 @@ write_sensor_fault_state() {
         "sensor_fault" \
         0 \
         "$fan_state" \
-        "$fan_state" \
+        "$hw_state" \
         0 \
         "$pwm_enable_value"
 }
