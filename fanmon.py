@@ -163,6 +163,22 @@ def collect() -> dict:
 
     policy_state = _read_policy_state()
 
+    # Treat an aged state file as absent rather than current. A stopped daemon
+    # leaves its last publication behind in /run, and consuming it would report
+    # that daemon's fan level, commanded state and rule as though they were
+    # live — "SENSOR FAULT" especially, which asserts a hardware condition
+    # nobody is still checking once the exit trap has restored BIOS control.
+    # Every field below already falls back to a hardware-derived value when its
+    # key is missing, so clearing the dict routes all of them to live sysfs in
+    # one place, instead of leaving some fields fresh and others stranded.
+    # 15s matches the plasmoid's stale threshold.
+    try:
+        state_age = time.time() - int(policy_state.get("timestamp", "0") or 0)
+    except ValueError:
+        state_age = float("inf")
+    if state_age > POLICY_STATE_STALE_S:
+        policy_state = {}
+
     # ── fan level from cooling device ──────────────────────────────────────
     cd = find_cooling_device("dell-smm-fan1")
     if cd:
@@ -179,20 +195,9 @@ def collect() -> dict:
     # Carried through so active_rule_indexes() can short-circuit on
     # sensor_fault. Without this the daemon's rule never reaches the selector
     # and fanmon silently re-derives a band from temperatures the daemon has
-    # already told us are placeholders. Defaults to "" for older daemons whose
-    # state file predates the key.
-    #
-    # Honoured only while the state file is fresh. A stopped daemon leaves its
-    # last rule behind in /run, and continuing to report "SENSOR FAULT" after
-    # the process that observed it has exited asserts a live hardware condition
-    # nobody is still checking — the exit trap has already restored BIOS
-    # control by then. 15s matches the plasmoid's stale threshold.
-    try:
-        state_age = time.time() - int(policy_state.get("timestamp", "0") or 0)
-    except ValueError:
-        state_age = float("inf")
-    data["policy_rule"] = (
-        policy_state.get("policy_rule", "") if state_age <= POLICY_STATE_STALE_S else "")
+    # already told us are placeholders. Empty for older daemons whose state
+    # file predates the key, and for a state file aged out above.
+    data["policy_rule"] = policy_state.get("policy_rule", "")
 
     # ── discrepancy detection ───────────────────────────────────────────────
     discrepancies = []
