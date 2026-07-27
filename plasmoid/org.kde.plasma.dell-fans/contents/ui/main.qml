@@ -85,6 +85,15 @@ PlasmoidItem {
     }
 
     function activeRuleLabel() {
+        // A stopped daemon leaves its last rule behind in /run, so without this
+        // gate the popup keeps asserting whatever was true when it died. That
+        // was already true of every band; "SENSOR FAULT" simply makes it
+        // conspicuous, since it claims an active hardware condition rather
+        // than merely a stale one. Matches the tooltip's wording and the
+        // shared 15s stale threshold.
+        if (stale)
+            return "No recent fan data";
+
         const medMs = data.medium_elapsed_ms || 0;
         switch (data.policy_rule) {
         case "sensor_fault":

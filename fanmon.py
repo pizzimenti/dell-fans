@@ -64,6 +64,9 @@ HIGH_AFTER_MEDIUM_MS = 5_000
 ANY_TEMP_GUARDRAIL_C = 80
 LOW_SETTLED_RPM_MARGIN = 500
 LOW_MISMATCH_RPM_MARGIN = 1500
+# Age past which /run/dell-fan-policy/state is treated as abandoned rather than
+# current. Matches the plasmoid's `stale` threshold in main.qml.
+POLICY_STATE_STALE_S = 15
 
 FAN_LEVEL_NAMES  = {0: "OFF", 1: "LOW", 2: "HIGH", 3: "MED"}
 FAN_LEVEL_DOTS   = {
@@ -178,7 +181,18 @@ def collect() -> dict:
     # and fanmon silently re-derives a band from temperatures the daemon has
     # already told us are placeholders. Defaults to "" for older daemons whose
     # state file predates the key.
-    data["policy_rule"] = policy_state.get("policy_rule", "")
+    #
+    # Honoured only while the state file is fresh. A stopped daemon leaves its
+    # last rule behind in /run, and continuing to report "SENSOR FAULT" after
+    # the process that observed it has exited asserts a live hardware condition
+    # nobody is still checking — the exit trap has already restored BIOS
+    # control by then. 15s matches the plasmoid's stale threshold.
+    try:
+        state_age = time.time() - int(policy_state.get("timestamp", "0") or 0)
+    except ValueError:
+        state_age = float("inf")
+    data["policy_rule"] = (
+        policy_state.get("policy_rule", "") if state_age <= POLICY_STATE_STALE_S else "")
 
     # ── discrepancy detection ───────────────────────────────────────────────
     discrepancies = []
