@@ -341,11 +341,33 @@ def build_criteria(data: dict) -> list[dict]:
         ],
     })
 
+    # ── 5. Sensor fault ────────────────────────────────────────────────────
+    # Selected only when the daemon reports policy_rule=sensor_fault. In that
+    # mode the temperatures in the state file are 0 placeholders rather than
+    # readings, so this section shows no thresholds — there is nothing real to
+    # compare against, and rendering a band would invent a rule that isn't
+    # driving anything.
+    sections.append({
+        "header": "SENSOR FAULT - forcing max fan",
+        "logic": "info",
+        "rows": [
+            _row(True, "CPU/GPU temp read", None, None, "",
+                 note="unavailable - temps shown as 0 are placeholders"),
+        ],
+    })
+
     return sections
 
 
 def active_rule_indexes(data: dict, sections: list[dict]) -> list[int]:
     """Return the minimal set of rule sections that explain the current state."""
+    # A sensor fault short-circuits everything below: the daemon is holding max
+    # fan because it could not read a temperature, so deriving a band from the
+    # 0 placeholders in the state file would name a rule that is not actually
+    # driving the fan. The fault section is always the last one appended.
+    if data.get("policy_rule") == "sensor_fault":
+        return [len(sections) - 1]
+
     level = data["fan_level"]
     cpu_c = data["cpu_c"]
     gpu_c = data["gpu_c"]

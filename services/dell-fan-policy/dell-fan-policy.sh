@@ -55,14 +55,6 @@ seconds_to_ms() {
     printf '%s\n' $(( seconds * 1000 ))
 }
 
-# Liveness ping for the systemd watchdog (WatchdogSec= in the unit). No-op when
-# run outside systemd — NOTIFY_SOCKET is unset then, and the script still has to
-# work when invoked by hand or from test_policy.sh.
-sd_notify() {
-    [[ -n "${NOTIFY_SOCKET:-}" ]] || return 0
-    systemd-notify "$@" 2>/dev/null || true
-}
-
 write_runtime_state() {
     local cpu_c="$1"
     local gpu_c="$2"
@@ -98,21 +90,15 @@ write_runtime_state() {
     } >"$tmp"
     chmod 0644 "$tmp"
     mv "$tmp" "$path"
-
-    # Publishing runtime state IS the proof of life the watchdog wants, so the
-    # ping lives here rather than at the call sites. Any path that keeps the
-    # state file fresh — including the sensor-fault heartbeat below — keeps
-    # systemd satisfied, and any path that stops publishing correctly trips it.
-    # Keeping the two coupled means they cannot drift apart later.
-    sd_notify WATCHDOG=1
 }
 
 # Heartbeat for the degraded paths where a sensor read failed and the poll
 # loop restarts early. Without this the state file goes stale while the daemon
-# is very much alive and deliberately holding max fan — which reads to any
-# liveness consumer (the plasmoid, dell-fan-watchdog) as a wedged daemon.
-# Temperatures are published as 0 with policy_rule=sensor_fault rather than a
-# stale last-known value, so nobody mistakes them for a live reading.
+# is very much alive and deliberately holding max fan, so fanmon and the
+# plasmoid keep rendering the last good temperatures with no sign they are
+# frozen. Temperatures are published as 0 with policy_rule=sensor_fault rather
+# than a stale last-known value, so nobody mistakes them for a live reading —
+# consumers are expected to branch on sensor_fault rather than plot the zeros.
 write_sensor_fault_state() {
     local fan_state="$1"
     local rpm pwm_value pwm_enable_value
@@ -517,12 +503,6 @@ main() {
 
     current_state=0
     set_fan_state "$current_state"
-
-    # Type=notify holds the unit in "activating" until READY=1 arrives, so this
-    # must come after the hardware is discovered and manual mode is asserted —
-    # a unit that reports ready before it owns the fan would lie to anything
-    # ordered After= it.
-    sd_notify --ready
 
     while true; do
         if ! cpu_raw="$(read_sensor_value_millideg "k10temp" "$CPU_SENSOR_LABEL" 2>/dev/null)"; then

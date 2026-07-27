@@ -87,6 +87,12 @@ PlasmoidItem {
     function activeRuleLabel() {
         const medMs = data.medium_elapsed_ms || 0;
         switch (data.policy_rule) {
+        case "sensor_fault":
+            // The daemon could not read CPU or GPU temperature and is holding
+            // max fan until it can. Temperatures in the state file are 0
+            // placeholders, not readings — say so rather than letting the
+            // default "No policy data" imply the daemon is gone.
+            return "SENSOR FAULT — holding max fan (temps unavailable)";
         case "guardrail_high":
             return "Guardrail → HIGH (≥ 80°C)";
         case "high_band":
