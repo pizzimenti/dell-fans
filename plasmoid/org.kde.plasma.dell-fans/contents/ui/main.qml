@@ -40,6 +40,13 @@ PlasmoidItem {
 
     readonly property bool stale: !data || !data.timestamp ||
         (Math.floor(Date.now() / 1000) - data.timestamp) > 15
+    // `stale` tracks *the helper's* liveness: its timestamp is stamped fresh on
+    // every poll for as long as the helper runs, so it stays false even after
+    // the daemon has died. policy_timestamp is the daemon's own publication
+    // time, and is the only field that reveals a rule left abandoned in /run.
+    // Gating anything daemon-related on `stale` would never fire.
+    readonly property bool policyStale: !data || !data.policy_timestamp ||
+        (Math.floor(Date.now() / 1000) - data.policy_timestamp) > 15
     readonly property real hottestC: Math.max(data.cpu_c || 0, data.gpu_c || 0)
     readonly property real hottestGuardrailC: Math.max(hottestC, data.wifi_c || 0)
     readonly property real triggerTempC: hottestGuardrailC >= 80 ? hottestGuardrailC : hottestC
@@ -89,9 +96,10 @@ PlasmoidItem {
         // gate the popup keeps asserting whatever was true when it died. That
         // was already true of every band; "SENSOR FAULT" simply makes it
         // conspicuous, since it claims an active hardware condition rather
-        // than merely a stale one. Matches the tooltip's wording and the
-        // shared 15s stale threshold.
-        if (stale)
+        // than merely a stale one. Gated on policyStale, not stale — the
+        // latter only tracks the helper, which keeps polling happily after the
+        // daemon is gone.
+        if (policyStale)
             return "No recent fan data";
 
         const medMs = data.medium_elapsed_ms || 0;
@@ -525,7 +533,7 @@ PlasmoidItem {
     // machine whose temperature is in fact unknown.
     toolTipSubText: root.stale || root.data.fan_level < 0
         ? "No recent fan data"
-        : root.data.policy_rule === "sensor_fault"
+        : root.data.policy_rule === "sensor_fault" && !root.policyStale
           ? data.fan_rpm.toLocaleString() + " RPM"
             + "\n" + "Temps unavailable — sensor fault"
           : data.fan_rpm.toLocaleString() + " RPM"

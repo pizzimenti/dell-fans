@@ -124,6 +124,12 @@ def collect_compact():
     # the widget is collapsed, and the tooltip would keep formatting the state
     # file's 0 placeholders as a real temperature.
     lines.append(f"policy_rule={policy_state.get('policy_rule', '')}")
+    # The daemon's own publication time, distinct from the `timestamp` above —
+    # that one is *this helper's* collection time and refreshes every poll for
+    # as long as the helper runs, so it says nothing about whether the daemon
+    # is alive. Without a separate field the QML cannot tell a live rule from
+    # one abandoned in /run by a stopped daemon.
+    lines.append(f"policy_timestamp={policy_state.get('timestamp', '0') or '0'}")
 
     k10    = find_hwmon("k10temp")
     amdgpu = find_hwmon("amdgpu")
@@ -200,6 +206,10 @@ def collect():
     cmd_state        = int(policy_state.get("cmd_state",       hw_level) or hw_level)
     medium_elapsed_ms = int(policy_state.get("medium_elapsed_ms", "0") or 0)
     policy_rule      = policy_state.get("policy_rule", "")
+    # See the note in collect_compact(): this is the daemon's publication time,
+    # not this helper's collection time, and it is the only field that reveals
+    # a stopped daemon whose last rule is still sitting in /run.
+    policy_timestamp = policy_state.get("timestamp", "0") or "0"
     lines += [
         f"fan_level={fan_level}",
         f"fan_level_max={fan_level_max}",
@@ -207,6 +217,7 @@ def collect():
         f"cmd_state={cmd_state}",
         f"medium_elapsed_ms={medium_elapsed_ms}",
         f"policy_rule={policy_rule}",
+        f"policy_timestamp={policy_timestamp}",
     ]
 
     # ── policy sensor inputs ──────────────────────────────────────────────
