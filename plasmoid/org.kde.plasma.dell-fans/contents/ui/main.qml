@@ -146,8 +146,12 @@ PlasmoidItem {
     // Lifted out of parseState so we don't rebuild Sets or recompile regexes
     // on every poll. parseState runs 1 Hz while expanded; keeping these at
     // component scope drops the hot-loop allocation.
+    // Any key the helper emits must be listed here (or handled by an explicit
+    // branch in parseState), otherwise it is silently dropped and reads back as
+    // undefined — which is how policy_timestamp shipped a gate that was stuck
+    // permanently on. tools/check_state_contract.py enforces this both ways.
     readonly property var _intKeys: new Set([
-        "timestamp", "fan_rpm", "fan_target", "fan_max", "fan_min",
+        "timestamp", "policy_timestamp", "fan_rpm", "fan_target", "fan_max", "fan_min",
         "pwm_pct", "pwm_enable", "pwm_raw",
         "fan_level", "fan_level_max", "hw_level", "cmd_state",
         "medium_elapsed_ms", "temp_count", "discrepancy_count"
