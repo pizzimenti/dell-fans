@@ -158,6 +158,40 @@ The daemon (`dell-fan-policy.sh`) drives a stepped fan policy from CPU and GPU t
 - BIOS auto mode is restored on daemon exit.
 - The daemon restarts automatically after suspend/resume.
 
+### Manual mode is not fail-safe
+
+While `pwm1_enable=1` the hardware holds whatever level was last commanded; it
+does **not** revert to the BIOS curve if the process that set it goes away. A
+daemon that dies with the fan grabbed is a thermal risk, not a cosmetic bug.
+
+Every way the daemon can *exit* is covered three times over: an `EXIT` trap,
+`INT`/`TERM`/`HUP` traps, and `ExecStopPost=` in the unit, which runs no matter
+how the main process died — `SIGKILL` and OOM included.
+
+What is **not** covered is a daemon that stops polling *without* exiting. On
+this hardware the realistic version of that is a sysfs read blocking against an
+unresponsive EC, which leaves bash in uninterruptible `D` state: signals stay
+pending, systemd cannot reap the main process, and `ExecStopPost=` never runs.
+No userspace guard fixes that — restoring auto means writing `pwm1_enable`
+through the same wedged driver, which blocks identically. It is documented here
+rather than defended against, because a guard that cannot act on the failure it
+names is worse than no guard: it invites false confidence.
+
+> **If you hand-rolled a udev rule to force manual mode, remove it.** A rule
+> like `ATTR{name}=="dell_smm", ATTR{pwm1_enable}="1"` asserts manual control on
+> every device-add — every boot, every module reload — whether or not the daemon
+> is running. That manufactures unowned manual fan control, and it's redundant:
+> `enable_manual_mode()` already asserts it at daemon startup and during
+> mismatch recovery, and only when something is there to drive the fan.
+
+### Sensor faults
+
+If a CPU or GPU temperature read fails, the daemon forces max fan and keeps
+publishing runtime state with `policy_rule=sensor_fault` and temperatures of
+`0`. Those zeros are placeholders, not readings — `fanmon` and the plasmoid both
+branch on `sensor_fault` and say so, rather than rendering them as a cold
+system or letting the state file go stale.
+
 ## Terminal Monitor
 
 ```bash

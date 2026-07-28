@@ -40,6 +40,13 @@ PlasmoidItem {
 
     readonly property bool stale: !data || !data.timestamp ||
         (Math.floor(Date.now() / 1000) - data.timestamp) > 15
+    // `stale` tracks *the helper's* liveness: its timestamp is stamped fresh on
+    // every poll for as long as the helper runs, so it stays false even after
+    // the daemon has died. policy_timestamp is the daemon's own publication
+    // time, and is the only field that reveals a rule left abandoned in /run.
+    // Gating anything daemon-related on `stale` would never fire.
+    readonly property bool policyStale: !data || !data.policy_timestamp ||
+        (Math.floor(Date.now() / 1000) - data.policy_timestamp) > 15
     readonly property real hottestC: Math.max(data.cpu_c || 0, data.gpu_c || 0)
     readonly property real hottestGuardrailC: Math.max(hottestC, data.wifi_c || 0)
     readonly property real triggerTempC: hottestGuardrailC >= 80 ? hottestGuardrailC : hottestC
@@ -85,8 +92,24 @@ PlasmoidItem {
     }
 
     function activeRuleLabel() {
+        // A stopped daemon leaves its last rule behind in /run, so without this
+        // gate the popup keeps asserting whatever was true when it died. That
+        // was already true of every band; "SENSOR FAULT" simply makes it
+        // conspicuous, since it claims an active hardware condition rather
+        // than merely a stale one. Gated on policyStale, not stale — the
+        // latter only tracks the helper, which keeps polling happily after the
+        // daemon is gone.
+        if (policyStale)
+            return "No recent fan data";
+
         const medMs = data.medium_elapsed_ms || 0;
         switch (data.policy_rule) {
+        case "sensor_fault":
+            // The daemon could not read CPU or GPU temperature and is holding
+            // max fan until it can. Temperatures in the state file are 0
+            // placeholders, not readings — say so rather than letting the
+            // default "No policy data" imply the daemon is gone.
+            return "SENSOR FAULT — holding max fan (temps unavailable)";
         case "guardrail_high":
             return "Guardrail → HIGH (≥ 80°C)";
         case "high_band":
@@ -123,8 +146,12 @@ PlasmoidItem {
     // Lifted out of parseState so we don't rebuild Sets or recompile regexes
     // on every poll. parseState runs 1 Hz while expanded; keeping these at
     // component scope drops the hot-loop allocation.
+    // Any key the helper emits must be listed here (or handled by an explicit
+    // branch in parseState), otherwise it is silently dropped and reads back as
+    // undefined — which is how policy_timestamp shipped a gate that was stuck
+    // permanently on. tools/check_state_contract.py enforces this both ways.
     readonly property var _intKeys: new Set([
-        "timestamp", "fan_rpm", "fan_target", "fan_max", "fan_min",
+        "timestamp", "policy_timestamp", "fan_rpm", "fan_target", "fan_max", "fan_min",
         "pwm_pct", "pwm_enable", "pwm_raw",
         "fan_level", "fan_level_max", "hw_level", "cmd_state",
         "medium_elapsed_ms", "temp_count", "discrepancy_count"
@@ -505,9 +532,15 @@ PlasmoidItem {
     Plasmoid.icon: "temperature-normal"
 
     toolTipMainText: "dell-fans  " + levelDots(data.fan_level) + "  " + levelName(data.fan_level)
+    // During a sensor fault the state file carries 0 placeholders rather than
+    // readings, so formatting triggerTempC would report a confident 32°F on a
+    // machine whose temperature is in fact unknown.
     toolTipSubText: root.stale || root.data.fan_level < 0
         ? "No recent fan data"
-        : data.fan_rpm.toLocaleString() + " RPM"
-          + "\n" + toF(triggerTempC).toFixed(0) + "°F"
+        : root.data.policy_rule === "sensor_fault" && !root.policyStale
+          ? data.fan_rpm.toLocaleString() + " RPM"
+            + "\n" + "Temps unavailable — sensor fault"
+          : data.fan_rpm.toLocaleString() + " RPM"
+            + "\n" + toF(triggerTempC).toFixed(0) + "°F"
     toolTipTextFormat: Text.PlainText
 }

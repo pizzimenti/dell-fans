@@ -64,6 +64,9 @@ HIGH_AFTER_MEDIUM_MS = 5_000
 ANY_TEMP_GUARDRAIL_C = 80
 LOW_SETTLED_RPM_MARGIN = 500
 LOW_MISMATCH_RPM_MARGIN = 1500
+# Age past which /run/dell-fan-policy/state is treated as abandoned rather than
+# current. Matches the plasmoid's `stale` threshold in main.qml.
+POLICY_STATE_STALE_S = 15
 
 FAN_LEVEL_NAMES  = {0: "OFF", 1: "LOW", 2: "HIGH", 3: "MED"}
 FAN_LEVEL_DOTS   = {
@@ -160,6 +163,22 @@ def collect() -> dict:
 
     policy_state = _read_policy_state()
 
+    # Treat an aged state file as absent rather than current. A stopped daemon
+    # leaves its last publication behind in /run, and consuming it would report
+    # that daemon's fan level, commanded state and rule as though they were
+    # live — "SENSOR FAULT" especially, which asserts a hardware condition
+    # nobody is still checking once the exit trap has restored BIOS control.
+    # Every field below already falls back to a hardware-derived value when its
+    # key is missing, so clearing the dict routes all of them to live sysfs in
+    # one place, instead of leaving some fields fresh and others stranded.
+    # 15s matches the plasmoid's stale threshold.
+    try:
+        state_age = time.time() - int(policy_state.get("timestamp", "0") or 0)
+    except ValueError:
+        state_age = float("inf")
+    if state_age > POLICY_STATE_STALE_S:
+        policy_state = {}
+
     # ── fan level from cooling device ──────────────────────────────────────
     cd = find_cooling_device("dell-smm-fan1")
     if cd:
@@ -173,6 +192,12 @@ def collect() -> dict:
         data["hw_level"]      = -1
     data["cmd_state"] = int(policy_state.get("cmd_state", data["hw_level"]) or data["hw_level"])
     data["medium_elapsed_ms"] = int(policy_state.get("medium_elapsed_ms", "0") or 0)
+    # Carried through so active_rule_indexes() can short-circuit on
+    # sensor_fault. Without this the daemon's rule never reaches the selector
+    # and fanmon silently re-derives a band from temperatures the daemon has
+    # already told us are placeholders. Empty for older daemons whose state
+    # file predates the key, and for a state file aged out above.
+    data["policy_rule"] = policy_state.get("policy_rule", "")
 
     # ── discrepancy detection ───────────────────────────────────────────────
     discrepancies = []
@@ -341,11 +366,33 @@ def build_criteria(data: dict) -> list[dict]:
         ],
     })
 
+    # ── 5. Sensor fault ────────────────────────────────────────────────────
+    # Selected only when the daemon reports policy_rule=sensor_fault. In that
+    # mode the temperatures in the state file are 0 placeholders rather than
+    # readings, so this section shows no thresholds — there is nothing real to
+    # compare against, and rendering a band would invent a rule that isn't
+    # driving anything.
+    sections.append({
+        "header": "SENSOR FAULT - forcing max fan",
+        "logic": "info",
+        "rows": [
+            _row(met=True, label="CPU/GPU temp read", value=None, threshold=None,
+                 unit="", note="unavailable - temps shown as 0 are placeholders"),
+        ],
+    })
+
     return sections
 
 
 def active_rule_indexes(data: dict, sections: list[dict]) -> list[int]:
     """Return the minimal set of rule sections that explain the current state."""
+    # A sensor fault short-circuits everything below: the daemon is holding max
+    # fan because it could not read a temperature, so deriving a band from the
+    # 0 placeholders in the state file would name a rule that is not actually
+    # driving the fan. The fault section is always the last one appended.
+    if data.get("policy_rule") == "sensor_fault":
+        return [len(sections) - 1]
+
     level = data["fan_level"]
     cpu_c = data["cpu_c"]
     gpu_c = data["gpu_c"]

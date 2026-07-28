@@ -99,6 +99,34 @@ def read_policy_state():
     return parsed
 
 
+# Age past which /run/dell-fan-policy/state is treated as abandoned rather than
+# current. Matches fanmon.POLICY_STATE_STALE_S and main.qml's stale thresholds.
+POLICY_STATE_STALE_S = 15
+
+
+def read_policy_state_gated():
+    """Daemon state, emptied once it ages out, plus its raw timestamp.
+
+    A stopped daemon leaves its last publication sitting in /run. Every caller
+    below already falls back to a live sysfs reading when a key is absent, so
+    returning an empty dict routes all of them to hardware truth in one place —
+    rather than leaving some fields fresh and others stranded, which is the
+    asymmetry that made gating only the rule label insufficient.
+
+    The raw timestamp is returned separately and reported verbatim so the QML
+    can still tell "daemon stopped recently" from "daemon never ran".
+    """
+    state = read_policy_state()
+    raw_ts = state.get("timestamp", "0") or "0"
+    try:
+        age = time.time() - int(raw_ts)
+    except ValueError:
+        return {}, "0"
+    if age > POLICY_STATE_STALE_S:
+        return {}, raw_ts
+    return state, raw_ts
+
+
 def collect_compact():
     # Minimal read path for the system-tray compact representation. The panel
     # icon only needs the triggerTempC (cpu/gpu/wifi) and the tooltip needs
@@ -111,12 +139,25 @@ def collect_compact():
     fan_rpm = _read_int(f"{dell}/fan1_input") if dell else 0
     lines.append(f"fan_rpm={fan_rpm}")
 
-    policy_state = read_policy_state()
+    policy_state, policy_ts = read_policy_state_gated()
     try:
         fan_level = int(policy_state.get("fan_level", "-1") or "-1")
     except ValueError:
         fan_level = -1
     lines.append(f"fan_level={fan_level}")
+
+    # Carry policy_rule through the compact path as well. The QML parser merges
+    # compact polls over the last full poll, preserving unset keys — so omitting
+    # this would leave the previous rule on screen for a fault that starts while
+    # the widget is collapsed, and the tooltip would keep formatting the state
+    # file's 0 placeholders as a real temperature.
+    lines.append(f"policy_rule={policy_state.get('policy_rule', '')}")
+    # The daemon's own publication time, distinct from the `timestamp` above —
+    # that one is *this helper's* collection time and refreshes every poll for
+    # as long as the helper runs, so it says nothing about whether the daemon
+    # is alive. Reported verbatim even when the state has aged out, so the QML
+    # can distinguish a recently-stopped daemon from one that never ran.
+    lines.append(f"policy_timestamp={policy_ts}")
 
     k10    = find_hwmon("k10temp")
     amdgpu = find_hwmon("amdgpu")
@@ -177,7 +218,7 @@ def collect():
         dell_temps = []
 
     # ── policy telemetry ──────────────────────────────────────────────────
-    policy_state = read_policy_state()
+    policy_state, policy_ts = read_policy_state_gated()
 
     cd = find_cooling_device("dell-smm-fan1")
     if cd:
@@ -193,6 +234,12 @@ def collect():
     cmd_state        = int(policy_state.get("cmd_state",       hw_level) or hw_level)
     medium_elapsed_ms = int(policy_state.get("medium_elapsed_ms", "0") or 0)
     policy_rule      = policy_state.get("policy_rule", "")
+    # See the note in collect_compact(): this is the daemon's publication time,
+    # not this helper's collection time, and it is the only field that reveals
+    # a stopped daemon whose last rule is still sitting in /run. Taken from the
+    # gated reader's second return value rather than from policy_state, which
+    # is emptied once the state ages out.
+    policy_timestamp = policy_ts
     lines += [
         f"fan_level={fan_level}",
         f"fan_level_max={fan_level_max}",
@@ -200,6 +247,7 @@ def collect():
         f"cmd_state={cmd_state}",
         f"medium_elapsed_ms={medium_elapsed_ms}",
         f"policy_rule={policy_rule}",
+        f"policy_timestamp={policy_timestamp}",
     ]
 
     # ── policy sensor inputs ──────────────────────────────────────────────

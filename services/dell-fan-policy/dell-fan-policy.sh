@@ -92,6 +92,40 @@ write_runtime_state() {
     mv "$tmp" "$path"
 }
 
+# Heartbeat for the degraded paths where a sensor read failed and the poll
+# loop restarts early. Without this the state file goes stale while the daemon
+# is very much alive and deliberately holding max fan, so fanmon and the
+# plasmoid keep rendering the last good temperatures with no sign they are
+# frozen. Temperatures are published as 0 with policy_rule=sensor_fault rather
+# than a stale last-known value, so nobody mistakes them for a live reading —
+# consumers are expected to branch on sensor_fault rather than plot the zeros.
+write_sensor_fault_state() {
+    local fan_state="$1"
+    local rpm pwm_value pwm_enable_value hw_state
+
+    rpm="$(read_fan_rpm)"
+    pwm_value="$(read_pwm_value)"
+    pwm_enable_value="$(read_pwm_enable)"
+    # Report what the hardware actually reports, not what we asked for.
+    # Passing fan_state here would make hw_level equal cmd_state by
+    # construction, hiding the firmware mismatch the normal poll loop exists to
+    # detect — a sensor fault is exactly when that discrepancy matters most,
+    # since temperatures are no longer available to reason about.
+    hw_state="$(read_hw_fan_state)"
+
+    write_runtime_state \
+        0 0 0 \
+        "$fan_state" \
+        "$rpm" \
+        "$(( pwm_value * 100 / 255 ))" \
+        "sensor_fault" \
+        0 \
+        "$fan_state" \
+        "$hw_state" \
+        0 \
+        "$pwm_enable_value"
+}
+
 read_first_line() {
     local path="$1"
     [[ -r "$path" ]] || return 1
@@ -481,6 +515,7 @@ main() {
             log "WARNING: CPU sensor unavailable; forcing max fan state"
             current_state="$(clamp_state "$max_state")"
             set_fan_state "$current_state"
+            write_sensor_fault_state "$current_state"
             sleep "$POLL_FAST_SECONDS"
             continue
         fi
@@ -489,6 +524,7 @@ main() {
             log "WARNING: GPU sensor unavailable; forcing max fan state"
             current_state="$(clamp_state "$max_state")"
             set_fan_state "$current_state"
+            write_sensor_fault_state "$current_state"
             sleep "$POLL_FAST_SECONDS"
             continue
         fi

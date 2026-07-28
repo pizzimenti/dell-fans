@@ -4,6 +4,59 @@ All notable changes to this project are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] — 2026-07-28
+
+### Changed
+
+- **`fanmon` and the plasmoid now understand `policy_rule=sensor_fault`.**
+  Neither consumer knew about the new value, so both invented a rule
+  that wasn't driving anything. `fanmon`'s `active_rule_indexes()`
+  re-derives the band from raw temperatures and would have shown
+  "HIGH band" next to 0 °C readings; the plasmoid's `activeRuleLabel()`
+  had no matching case and fell through to "No policy data", implying
+  the daemon was gone when it was in fact running and deliberately
+  holding max fan. Both now short-circuit on `sensor_fault` and say so.
+  `fanmon` gains a dedicated section with no thresholds — during a fault
+  there is nothing real to compare against.
+
+### Fixed
+
+- **The daemon stopped publishing runtime state during sensor faults.**
+  Both degraded paths in the poll loop (`CPU sensor unavailable` /
+  `GPU sensor unavailable`) force max fan and then `continue`, skipping
+  the `write_runtime_state` call at the bottom of the loop. A persistent
+  sensor fault therefore froze `/run/dell-fan-policy/state` at its last
+  good value while the daemon was very much alive and deliberately
+  holding max fan — so the plasmoid and fanmon showed stale
+  temperatures with no indication they were stale. Both paths now emit a
+  heartbeat via `write_sensor_fault_state`, publishing temperatures as
+  `0` with `policy_rule=sensor_fault` rather than a stale last-known
+  value, so nobody mistakes them for a live reading.
+
+### Removed
+
+- **`/etc/udev/rules.d/99-dell-fan-manual.rules`** (an out-of-tree file
+  on the maintainer's machine — never shipped by this repo, but worth
+  recording in case anyone else hand-rolled the same thing). The rule
+  was:
+
+  ```text
+  SUBSYSTEM=="hwmon", DEVPATH=="/devices/platform/dell_smm_hwmon/hwmon/*", \
+    ATTR{name}=="dell_smm", ATTR{pwm1_enable}="1"
+  ```
+
+  It forced `pwm1_enable=1` on every hwmon device-add — every boot,
+  every module reload — regardless of whether the daemon was running.
+  That is fail-dangerous: it manufactures unowned manual fan control,
+  where the hardware holds the last commanded level and never falls back
+  to the BIOS curve (see "Manual mode is not fail-safe" in the
+  README). Disabling
+  `dell-fan-policy.service` on such a machine would have produced a
+  system that boots into manual mode with nothing driving the fan. It
+  was also redundant — `enable_manual_mode()` in the daemon asserts
+  manual mode at startup and again during mismatch recovery, and only
+  ever does so when there is something to drive it.
+
 ## [0.2.3] — 2026-05-18
 
 ### Added
