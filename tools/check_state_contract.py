@@ -94,6 +94,16 @@ def main() -> int:
 
     try:
         emitted = emitted_keys()
+    except subprocess.TimeoutExpired:
+        # The helper reads sysfs, so on a wedged EC it can sit in
+        # uninterruptible I/O that neither the timeout nor the follow-up
+        # SIGKILL can clear — the same D-state case documented in the README.
+        # Nothing here can fix that; the contract simply cannot be checked
+        # against hardware that isn't answering, and saying so beats hanging
+        # or, worse, reporting a pass.
+        print("ERROR: helper timed out reading sysfs; contract not verified",
+              file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001 - surface any failure to the caller
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
